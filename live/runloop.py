@@ -17,6 +17,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from live.broker_binance import KLINE_COLS
 from live.notify import TelegramNotifier
 from live.risk import RiskGuard
 from live.strategy import FrozenMomentumStrategy
@@ -302,7 +303,7 @@ class RunLoop:
         except Exception as e:
             log.warning("  %s klines fetch failed: %s", symbol, e)
             return pd.DataFrame()
-        klines = pd.DataFrame(raw, columns=self.broker.KLINE_COLS)
+        klines = pd.DataFrame(raw, columns=KLINE_COLS)
         klines["open_time"] = pd.to_datetime(klines["open_time"], unit="ms", utc=True)
         klines["close_time"] = pd.to_datetime(klines["close_time"], unit="ms", utc=True)
         return klines
