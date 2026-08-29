@@ -1,7 +1,7 @@
 """Main loop for live trading, shared across testnet and future live modes.
 
-Encapsulates the signal-processing loop, state management, Telegram alerts,
-and clean shutdown handling.  Extracted from ``scripts/run_testnet.py``.
+Encapsulates the signal-processing loop, state management, risk guard,
+account bookkeeping, Telegram alerts, and clean shutdown handling.
 """
 from __future__ import annotations
 
@@ -10,17 +10,28 @@ import json
 import signal
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from live.notify import TelegramNotifier
+from live.risk import RiskGuard
 from live.strategy import FrozenMomentumStrategy
 from research.config import PassedConfig
 from research.log import get_logger
 
 log = get_logger("runloop")
+
+LOG_COLUMNS = [
+    "bar", "symbol", "mark", "signal", "pos", "qty", "equity", "n_orders", "halted",
+]
+ORDER_COLUMNS = [
+    "client_order_id", "exchange_id", "bar", "symbol", "side", "action",
+    "reduce_only", "qty", "avg_price", "status", "ts", "pnl", "pnl_pct",
+]
 
 
 def _first_unprocessed_idx(klines: pd.DataFrame, last_bar: str | None) -> int:
@@ -82,6 +93,16 @@ def _oid(seq: int, kind: str, symbol: str) -> str:
     return f"TN{seq:04d}{tag}{kind[:3]}"[:36]
 
 
+def _append_csv(path: Path, rows: list[dict], columns: list[str]) -> None:
+    """Append rows to a CSV ledger file, writing headers on first write."""
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame(rows, columns=columns)
+    header = not path.exists()
+    df.to_csv(path, mode="a", header=header, index=False)
+
+
 class RunLoop:
     """Manages the per-symbol strategy state, broker interaction, and alerts.
 
@@ -118,6 +139,22 @@ class RunLoop:
             config.notional_frac / len(self.symbols) if config.symbols else config.notional_frac
         )
 
+        self.log_path = report_dir / "testnet_log.csv"
+        self.orders_path = report_dir / "testnet_orders.csv"
+        self.account_path = report_dir / "testnet_account.json"
+
+        self.account: dict = self._load_account()
+        self.risk = RiskGuard(
+            notional_frac=self.frac_each,
+            max_leverage=float(config.risk.max_leverage),
+            daily_loss_halt=float(config.risk.daily_loss_halt),
+            max_drawdown_halt=float(config.risk.max_drawdown_halt),
+            day_start_equity=float(self.account.get("day_start_equity") or 0),
+            peak_equity=float(self.account.get("peak_equity") or 0),
+            halted=bool(self.account.get("halted")),
+            halt_reason=str(self.account.get("halt_reason") or ""),
+        )
+
         self.strategies: dict[str, FrozenMomentumStrategy] = {}
         self.states: dict[str, dict] = {}
         for sym in self.symbols:
@@ -145,6 +182,46 @@ class RunLoop:
         """Path to the legacy single-file state (BTCUSDT only)."""
         return self.report_dir / "testnet_state.json"
 
+    def _load_account(self) -> dict:
+        """Load persisted account bookkeeping, or defaults."""
+        if self.account_path.exists():
+            return json.loads(self.account_path.read_text())
+        return {
+            "peak_equity": 0.0,
+            "day": None,
+            "day_start_equity": 0.0,
+            "halted": False,
+            "halt_reason": "",
+            "order_seq": 0,
+            "equity": 0.0,
+            "wallet": 0.0,
+            "unrealized": 0.0,
+        }
+
+    def _save_account(self) -> None:
+        """Persist account bookkeeping to disk."""
+        self.account_path.parent.mkdir(parents=True, exist_ok=True)
+        self.account_path.write_text(json.dumps(self.account, indent=2, default=float))
+
+    def _refresh_equity(self) -> float:
+        """Fetch equity from the broker, roll the day, and update peak."""
+        bal = self.broker.usdt_balance()
+        equity = float(bal.get("equity") if bal.get("equity") is not None else bal.get("wallet") or 0.0)
+        day = pd.Timestamp.now(tz="UTC").date().isoformat()
+        if self.account.get("day") != day:
+            self.account["day"] = day
+            self.account["day_start_equity"] = equity
+            if not self.account.get("halted"):
+                self.account["halt_reason"] = ""
+            self.risk.day_start_equity = equity
+        if equity > float(self.account.get("peak_equity") or 0):
+            self.account["peak_equity"] = equity
+            self.risk.peak_equity = equity
+        self.account["equity"] = equity
+        self.account["wallet"] = float(bal.get("wallet") or equity)
+        self.account["unrealized"] = float(bal.get("unrealized") or 0)
+        return equity
+
     def _load_state(self, symbol: str) -> dict:
         """Load persisted state for a symbol, or return defaults."""
         p = self._state_path(symbol)
@@ -168,6 +245,8 @@ class RunLoop:
             "pos": 0,
             "qty": 0.0,
             "entry": 0.0,
+            "bars_in_trade": 0,
+            "extreme": 0.0,
         }
 
     def _save_state(self, symbol: str, state: dict) -> None:
@@ -240,7 +319,7 @@ class RunLoop:
             symbol, side, qty, reduce_only=reduce_only, client_order_id=oid_str,
         )
 
-    def run_one_symbol(self, symbol: str) -> dict:
+    def run_one_symbol(self, symbol: str, equity: float) -> dict:
         """Process one bar for one symbol. Returns summary dict."""
         st = self.states[symbol]
         strat = self.strategies[symbol]
@@ -272,60 +351,104 @@ class RunLoop:
                 strat.on_bar_close(closes[: i + 1])
         sig = strat.curr_sig
 
-        if sig == 0 and st.get("pos") == 0:
-            pass  # no trade
-        elif sig != 0 and st.get("pos") != 0:
-            pass  # hold
-        else:
-            side = 1 if sig > 0 else -1 if sig < 0 else 0
-            qty = 0.0
-            if side != 0:
-                raw_qty = self.frac_each * st.get("equity", 1000) / max(mark, 1.0)
-                qty = self._round_qty(symbol, raw_qty)
-            if qty > 0 and qty * mark < self.min_notional and side != 0:
-                log.info(
-                    "  %s notional %.2f < min %.2f, skip open",
-                    symbol, qty * mark, self.min_notional,
-                )
-                qty = 0.0
-                side = 0
-            # Close existing position if needed
-            if st.get("pos") != 0 and side == 0:
-                oid_str = _oid(st.get("order_seq", 0) + 1, "CLS", symbol)
-                buy_side = "SELL" if st["pos"] > 0 else "BUY"
-                ord_resp = self._market_order(
-                    symbol, buy_side, abs(st.get("qty", 0)),
-                    reduce_only=True, oid_str=oid_str,
-                )
-                orders.append(ord_resp)
-                st["order_seq"] = st.get("order_seq", 0) + 1
-                st["pos"] = 0
-                st["qty"] = 0.0
-                st["entry"] = 0.0
-                st["hold_left"] = 0
-                st["bars_in_trade"] = 0
-                st["pred_pips"] = None
-                log.info("  %s 平仓 %s", symbol, buy_side)
+        # Risk guard: if halted, force target side to 0 (flatten on next step)
+        allowed = self.risk.check(equity)
+        self.account["halted"] = self.risk.halted
+        self.account["halt_reason"] = self.risk.halt_reason
+        target = int(np.sign(sig)) if allowed else 0
+        if not allowed:
+            log.warning("  %s 风控停机: %s", symbol, self.risk.halt_reason)
 
-            # Open new position if needed
-            if side != 0 and st.get("pos") == 0:
-                buy_side = "BUY" if side > 0 else "SELL"
-                oid_str = _oid(st.get("order_seq", 0) + 1, "OPN", symbol)
-                ord_resp = self._market_order(
-                    symbol, buy_side, qty, client_order_id=oid_str,
+        # Reconcile with exchange truth (post-crash safety)
+        try:
+            pos_row = self.broker.position(symbol)
+        except Exception as e:
+            return {"symbol": symbol, "error": f"position query failed: {e}"}
+        exch_amt = float(pos_row.get("positionAmt") or 0)
+        current = _pos_side(exch_amt)
+        entry_px = float(pos_row.get("entryPrice") or 0)
+        upnl = float(pos_row.get("unRealizedProfit") or 0)
+        exch_qty = abs(exch_amt)
+        if exch_qty == 0.0:
+            exch_qty = abs(float(st.get("qty") or 0))
+        if current == 0 and st.get("pos") != 0:
+            log.warning("  %s 交易所仓位与状态不一致（交易所空仓），重置本地状态", symbol)
+            st["pos"] = 0
+            st["qty"] = 0.0
+            st["entry"] = 0.0
+        elif current != 0 and st.get("pos") != current:
+            log.warning("  %s 交易所仓位与状态不一致（%s vs %s），以交易所为准", symbol, current, st.get("pos"))
+            st["pos"] = current
+            st["qty"] = exch_qty
+            st["entry"] = entry_px
+
+        now = datetime.now(UTC).isoformat()
+
+        def send(side_txt: str, qty: float, reduce_only: bool, action: str) -> dict:
+            nonlocal st
+            st["order_seq"] = int(st.get("order_seq") or 0) + 1
+            cid = _oid(st["order_seq"], action, symbol)
+            raw = self._market_order(symbol, side_txt, qty, reduce_only=reduce_only, oid_str=cid)
+            rec = {
+                "client_order_id": cid,
+                "exchange_id": raw.get("orderId"),
+                "bar": bar_id,
+                "symbol": symbol,
+                "side": side_txt,
+                "action": action,
+                "reduce_only": reduce_only,
+                "qty": float(raw.get("executedQty") or qty),
+                "avg_price": float(raw.get("avgPrice") or 0),
+                "status": raw.get("status"),
+                "ts": now,
+            }
+            orders.append(rec)
+            return rec
+
+        # Flatten if we hold but shouldn't (target==0 or direction flipped)
+        if current != 0 and (target != current or not allowed):
+            close_side = "SELL" if current > 0 else "BUY"
+            notional0 = entry_px * exch_qty
+            pnl_pct = (upnl / notional0) if (upnl != 0.0 and notional0 > 0) else None
+            rec = send(close_side, exch_qty, True, "CLOSE")
+            if pnl_pct is not None:
+                rec["pnl"] = float(upnl)
+                rec["pnl_pct"] = float(pnl_pct)
+            self.tg.fills([rec])
+            log.info("  %s 平仓 %s qty=%g upnl=%.2f", symbol, close_side, exch_qty, upnl)
+            current = 0
+            exch_qty = 0.0
+            st["pos"] = 0
+            st["qty"] = 0.0
+            st["entry"] = 0.0
+            st["extreme"] = 0.0
+
+        # Open if we have a target but no position
+        if target != 0 and current == 0 and self.risk.check(equity):
+            raw_qty = self.risk.target_qty(equity, mark)
+            qty = self._round_qty(symbol, raw_qty)
+            if qty <= 0 or qty * mark < max(self.min_notional, self.broker.min_notional(symbol)):
+                log.info(
+                    "  %s notional %.2f < min, skip open", symbol, (qty or 0.0) * mark,
                 )
-                orders.append(ord_resp)
-                st["order_seq"] = st.get("order_seq", 0) + 1
-                st["pos"] = side
+            else:
+                open_side = "BUY" if target > 0 else "SELL"
+                rec = send(open_side, qty, False, "OPEN")
+                self.tg.fills([rec])
+                log.info("  %s 开仓 %s qty=%g", symbol, open_side, qty)
+                # Record frozen prediction shape from the bar window
+                look = min(24, len(closes))
+                if look >= self.cfg.pip_n:
+                    from research.pips import find_pips
+
+                    _, py = find_pips(closes[-look:], self.cfg.pip_n, 3)
+                    st["pred_pips"] = [{"i": int(i), "y": float(y)} for i, y in zip(range(look), py, strict=False)]
+                st["pos"] = target
                 st["qty"] = qty
                 st["entry"] = mark
+                st["extreme"] = mark
                 st["hold_left"] = strat.hold_left
                 st["bars_in_trade"] = strat.bars_in_trade
-                st["pred_pips"] = [
-                    {"i": int(i), "y": float(y)}
-                    for i, y in zip(strat.pred_y or [], strat.pred_y or [], strict=False)
-                ]
-                log.info("  %s 开仓 %s qty=%g", symbol, buy_side, qty)
 
         # Update state
         st["last_bar"] = bar_id
@@ -335,26 +458,69 @@ class RunLoop:
         st["n_steps"] = st.get("n_steps", 0) + 1
         st["last_fit"] = strat.last_fit
         st["mark"] = mark
+        st["equity"] = equity
+        if st.get("pos"):
+            st["extreme"] = st.get("extreme") or st.get("entry") or 0.0
         self._save_state(symbol, st)
+
+        _append_csv(
+            self.log_path,
+            [{
+                "bar": bar_id,
+                "symbol": symbol,
+                "mark": mark,
+                "signal": float(sig),
+                "pos": int(st.get("pos") or 0),
+                "qty": float(st.get("qty") or 0),
+                "equity": equity,
+                "n_orders": len(orders),
+                "halted": self.risk.halted,
+            }],
+            LOG_COLUMNS,
+        )
+        _append_csv(self.orders_path, orders, ORDER_COLUMNS)
 
         return results
 
     def run_all(self) -> dict:
         """Process one bar for all symbols. Returns aggregated summary."""
         summary: dict = {"symbols": {}, "orders": []}
+        try:
+            equity = self._refresh_equity()
+        except Exception as e:
+            return {"error": f"equity fetch failed: {e}", "symbols": {}, "orders": []}
         for sym in self.symbols:
             try:
-                res = self.run_one_symbol(sym)
+                res = self.run_one_symbol(sym, equity)
                 summary["symbols"][sym] = res
                 summary["orders"].extend(res.get("orders", []))
             except Exception as e:
                 log.error("  %s error: %s", sym, e)
                 summary["symbols"][sym] = {"symbol": sym, "error": str(e)}
+            # Refresh equity after any fills so sizing stays accurate
+            with contextlib.suppress(Exception):
+                equity = self._refresh_equity()
+        self._save_account()
+        summary["equity"] = equity
+        summary["halted"] = self.risk.halted
+        summary["halt_reason"] = self.risk.halt_reason
         return summary
 
     def snapshot(self) -> dict:
         """Build a snapshot of current state for Telegram alerts."""
         legs = []
+        try:
+            bal = self.broker.usdt_balance()
+            self.account["equity"] = float(
+                bal.get("equity") if bal.get("equity") is not None else bal.get("wallet") or 0
+            )
+            self.account["wallet"] = float(bal.get("wallet") or 0)
+            self.account["unrealized"] = float(bal.get("unrealized") or 0)
+            if self.account["equity"] > float(self.account.get("peak_equity") or 0):
+                self.account["peak_equity"] = self.account["equity"]
+                self.risk.peak_equity = self.account["equity"]
+        except Exception as e:
+            log.warning("snapshot equity fetch failed: %s", e)
         for sym in self.symbols:
             st = self.states[sym]
             strat = self.strategies[sym]
@@ -368,7 +534,7 @@ class RunLoop:
                 "bars_in_trade": strat.bars_in_trade,
                 "hold_left": strat.hold_left,
             })
-        return {"legs": legs}
+        return {"acct": self.account, "legs": legs}
 
     def run_loop(self, loop_minutes: float) -> None:
         """Run the main loop, processing bars on a timer."""
@@ -387,6 +553,12 @@ class RunLoop:
 
         signal.signal(signal.SIGTERM, _stop)
         signal.signal(signal.SIGINT, _stop)
+
+        # Restore in-flight strategy state (PIP shape, entry, extreme) so a
+        # restart doesn't lose exit context for open positions.
+        for sym in self.symbols:
+            with contextlib.suppress(Exception):
+                self._restore_state(sym)
 
         with contextlib.suppress(Exception):
             self.tg.online(self.snapshot())
@@ -428,6 +600,10 @@ class RunLoop:
 
     def _handle_alerts(self, summary: dict) -> None:
         """Dispatch alerts for fills, warnings, and stale bars."""
+        if self.risk.halted:
+            self.tg.halt(self.risk.halt_reason, float(self.account.get("equity") or 0))
+        else:
+            self.tg.clear_halt()
         for sym, _res in summary.get("symbols", {}).items():
             st = self.states[sym]
             self.tg.fit_warn({

@@ -7,6 +7,7 @@ with a console handler and (optionally) a rotating file handler under
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import sys
 from pathlib import Path
 

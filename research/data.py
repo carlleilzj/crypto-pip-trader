@@ -269,12 +269,12 @@ def fetch_public_spot_klines(
     closed_only: bool = True,
 ) -> pd.DataFrame:
     """Public spot klines. No API key. Futures REST is geo-blocked (HTTP 451)."""
-    rows = []
-    end_ms = None
+    rows: list = []
+    end_ms: int | None = None
     remain = max(1, int(limit))
     while remain > 0:
         batch_n = min(1000, remain)
-        params = {"symbol": symbol, "interval": interval, "limit": batch_n}
+        params: dict[str, str | int] = {"symbol": symbol, "interval": interval, "limit": batch_n}
         if end_ms is not None:
             params["endTime"] = end_ms
         r = requests.get(PUBLIC_SPOT + "/api/v3/klines", params=params, timeout=30)

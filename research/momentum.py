@@ -93,6 +93,7 @@ def ts_momentum_pip_exit(
             i += 1
             continue
         pred_w = c[i - min(24, lookback) + 1 : i + 1]
+        pred_y: list[float] | np.ndarray
         if len(pred_w) >= pip_n:
             _, pred_y = find_pips(pred_w, pip_n, 3)
         else:

@@ -131,6 +131,7 @@ class BinanceUSDMBroker:
                 time.sleep(_RETRY_SLEEP_S)
                 continue
             raise err
+        raise err  # unreachable, satisfies type checkers
 
     def symbol_filters(self, symbol: str) -> dict:
         if self._filters is None:
@@ -190,7 +191,7 @@ class BinanceUSDMBroker:
     def usdt_balance(self) -> dict:
         acct = self.account()
         assets = acct.get("assets") or []
-        usdt = next((a for a in assets if a.get("asset") == "USDT"), {})
+        usdt: dict = next((a for a in assets if a.get("asset") == "USDT"), {})
         wallet = float(usdt.get("walletBalance") or acct.get("totalWalletBalance") or 0)
         unreal = float(usdt.get("unrealizedProfit") or acct.get("totalUnrealizedProfit") or 0)
         equity = float(acct.get("totalMarginBalance") or usdt.get("marginBalance") or (wallet + unreal))
