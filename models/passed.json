@@ -1,0 +1,22 @@
+{
+  "strategy": "mom_30d_cal20_pip_exit",
+  "symbol": "BTCUSDT",
+  "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+  "interval": "1h",
+  "lookback": 720,
+  "hold": 720,
+  "mode": "long_short",
+  "exit_mode": "pip",
+  "pip_n": 5,
+  "min_bars": 24,
+  "fit_exit": 0.0,
+  "notional_frac": 0.24489269335696373,
+  "train_hours": 17520,
+  "train_dd": -0.408,
+  "target_dd": 0.20,
+  "oos_return": 0.201448,
+  "oos_martin": 10.2515,
+  "oos_max_dd": -0.048316,
+  "p_block168": 0.047619047619047616,
+  "n_trades": 58
+}

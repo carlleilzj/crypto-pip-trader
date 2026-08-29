@@ -1,0 +1,51 @@
+symbol: BTCUSDT
+interval: 1h
+market: usdm
+
+pips:
+  n_pips: 5
+  lookback: 24
+  hold_period: 12
+  dist_measure: 3
+  dist_q: 0.3
+  min_cluster_size: 40
+  min_abs_martin: 3.0
+
+cluster:
+  k_min: 5
+  k_max: 40
+  k_step: 5
+  random_state: 42
+  n_init: 10
+
+walkforward:
+  train_hours: 17520
+  step_hours: 8760
+  skip_after_losing_fold: true
+
+costs:
+  taker_fee: 0.0004
+  slippage_bps: 1.0
+  use_funding: true
+
+risk:
+  notional_frac: 0.5
+  max_leverage: 2.0
+  daily_loss_halt: 0.05
+  max_drawdown_halt: 0.15
+
+backtest:
+  start_equity: 1000.0
+  fill: next_open
+
+permutation:
+  n_reps: 20
+
+baseline:
+  lookback: 168
+  hold: 168
+
+data:
+  start: "2020-01-01"
+  kline_path: data/BTCUSDT_1h.csv
+  funding_path: data/BTCUSDT_funding.csv

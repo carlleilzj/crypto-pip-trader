@@ -1,0 +1,11 @@
+[Unit]
+Description=crypto-pip-trader crash notify
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=piptrader
+Group=piptrader
+WorkingDirectory=/opt/crypto-pip-trader
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/crypto-pip-trader/.venv/bin/python scripts/tg_event.py --event crash

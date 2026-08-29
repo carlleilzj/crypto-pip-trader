@@ -1,0 +1,44 @@
+# Frozen after P0 gate pass. Do not retune against OOS.
+symbol: BTCUSDT
+symbols:
+  - BTCUSDT
+  - ETHUSDT
+  - SOLUSDT
+interval: 1h
+market: usdm
+
+strategy: mom_30d_cal20_pip_exit
+lookback: 720
+hold: 720
+mode: long_short
+exit_mode: pip
+pip_n: 5
+min_bars: 24
+fit_exit: 0.0
+
+# Stop-loss and trailing stop (applied in live execution)
+# stop_pct: 0.08       # hard stop: flatten on -8% from entry
+# trail_arm: 0.10      # trailing stop: arm after +10% profit
+# trail_giveback: 0.05 # flatten if price gives back 5% from in-trade extreme
+
+notional_frac: 0.24489269335696373
+calibrated_from:
+  train_hours: 17520
+  train_dd: -0.408
+  target_dd: 0.20
+  base_frac: 0.5
+
+costs:
+  taker_fee: 0.0004
+  slippage_bps: 1.0
+  use_funding: true
+
+risk:
+  notional_frac: 0.24489269335696373
+  max_leverage: 2.0
+  daily_loss_halt: 0.05
+  max_drawdown_halt: 0.15
+
+backtest:
+  start_equity: 1000.0
+  fill: next_open

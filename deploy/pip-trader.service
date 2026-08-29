@@ -1,0 +1,20 @@
+[Unit]
+Description=crypto-pip-trader Binance USDT-M testnet loop
+After=network-online.target
+Wants=network-online.target
+OnFailure=pip-trader-fail.service
+
+[Service]
+Type=simple
+User=piptrader
+Group=piptrader
+WorkingDirectory=/opt/crypto-pip-trader
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/crypto-pip-trader/.venv/bin/python scripts/run_testnet.py --loop 5
+Restart=always
+RestartSec=15
+MemoryMax=512M
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
