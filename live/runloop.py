@@ -298,8 +298,9 @@ class RunLoop:
     def _fetch_klines(self, symbol: str, limit: int = 200) -> pd.DataFrame:
         """Fetch klines from broker, returning a DataFrame with standard columns."""
         try:
-            raw = self.broker.klines(symbol, limit=limit)
-        except Exception:
+            raw = self.broker.klines(symbol, self.cfg.interval, limit=limit)
+        except Exception as e:
+            log.warning("  %s klines fetch failed: %s", symbol, e)
             return pd.DataFrame()
         klines = pd.DataFrame(raw, columns=self.broker.KLINE_COLS)
         klines["open_time"] = pd.to_datetime(klines["open_time"], unit="ms", utc=True)
