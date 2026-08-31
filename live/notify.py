@@ -330,6 +330,13 @@ class TelegramNotifier:
         for o in orders:
             self.send(format_fill(o))
 
+    def stop_placed(self, symbol: str, side: str, price: float) -> None:
+        self.send(
+            f"🛡 灾难止损已挂 {symbol} {_zh_side(side)} STOP_MARKET @ {_fmt_px(price)} (标记价触发)",
+            key=f"stop:{symbol}",
+            cooldown_s=3600,
+        )
+
     def fit_warn(self, leg: dict) -> None:
         fit = leg.get("fit")
         sym = str(leg.get("symbol") or "")

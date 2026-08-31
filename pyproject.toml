@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crypto-pip-trader"
-version = "0.2.0"
+version = "0.3.1"
 description = "Crypto perpetual futures momentum trading with PIP exit"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -37,6 +37,11 @@ fix = true
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "ARG"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test doubles intentionally mirror broker signatures even when args are
+# unused; ARG/F841 noise here is not actionable signal.
+"tests/*" = ["ARG", "F841"]
 
 [tool.mypy]
 python_version = "3.11"

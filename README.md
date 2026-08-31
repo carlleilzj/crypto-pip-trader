@@ -23,11 +23,17 @@ BTCUSDT USDT-M 永续。原 PIP+K-Means 形态挖掘已证伪；通过门禁的�
 
 并列通过：`long_flat`（下跌空仓）+ 同仓位，+29.3%，回撤 14.5%，p=0.048。
 
-**PIP 形态走样提前平**（fit&lt;0，同一套 OOS + 块置换）：+56.3%，Martin 7.61，回撤 14.3%，58 笔，**p=0.048，门禁通过**。Testnet 出场已切到 `exit_mode: pip`。`python scripts/compare_pip_exit.py`
+**PIP 形态走样提前平**（fit&lt;0，同一套 OOS + 块置换）：+56.3%，Martin 7.61，回撤 14.3%，58 笔，**p=0.048，门禁通过**。Testnet 出场已切到 `exit_mode: pip`。`python scripts/repro_gate.py`
 
 ## 硬门槛
 
 扣完成本后：净收益>0、Martin>0、交易≥5、跑赢买入持有、回撤<25%、块置换 p<0.05。
+
+## 实盘保护
+
+- **交易所侧灾难止损**：开仓同时挂 `STOP_MARKET`（`closePosition=true`，mark 价触发），进程宕机时仍生效。平仓时自动撤销。见 `live/broker_binance.py:stop_market_close`。
+- **状态恢复**：进程重启后从全量 K 线重放重建策略状态（`entry / bars_in_trade / hold_left / extreme / pred_y`），不再信任存档计数器；恢复失败发 Telegram。见 `live/runloop.py:_restore_state`。
+- **限频退避**：418/-1003 触发 10 分钟冷却，dashboard K 线缓存 60 秒。
 
 ## 流程
 
@@ -37,7 +43,8 @@ source .venv/bin/activate
 pip install -r requirements.txt
 python scripts/download_data.py
 python -m pytest tests -q
-python scripts/run_baseline.py
+python scripts/repro_gate.py            # 复现门禁(快,不含置换)
+python scripts/repro_gate.py --permutations 1000   # 含块置换 p 值(慢)
 python scripts/run_paper.py
 ```
 

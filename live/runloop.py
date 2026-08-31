@@ -145,6 +145,8 @@ class RunLoop:
         self.account_path = report_dir / "testnet_account.json"
 
         self.account: dict = self._load_account()
+        self._restored = False
+        self._cooldown_until = 0.0
         self.risk = RiskGuard(
             notional_frac=self.frac_each,
             max_leverage=float(config.risk.max_leverage),
@@ -227,7 +229,14 @@ class RunLoop:
         """Load persisted state for a symbol, or return defaults."""
         p = self._state_path(symbol)
         if p.exists():
-            return json.loads(p.read_text())
+            st = json.loads(p.read_text())
+            # Legacy states carried a duplicate frozen shape under
+            # "pred_pips"; "pred_y" (strategy-owned) is the single field now.
+            if "pred_pips" in st:
+                if not st.get("pred_y"):
+                    st["pred_y"] = [float(x["y"]) for x in st["pred_pips"]]
+                st.pop("pred_pips")
+            return st
         if symbol == "BTCUSDT":
             leg = self._legacy_state_path()
             if leg.exists():
@@ -258,43 +267,123 @@ class RunLoop:
             self._legacy_state_path().write_text(json.dumps(state, indent=2, default=float))
 
     def _restore_state(self, symbol: str) -> None:
-        """Restore intraday strategy state from a previous run.
+        """Rebuild strategy state for an open position after a restart.
 
-        Replays historical bars through the strategy to reconstruct PIP
-        state and bar counters.
+        The state is rebuilt by replaying the full kline history through a
+        fresh strategy: the current trade can be up to ``hold`` bars old, so
+        the window must span lookback + hold bars. Replaying is deterministic
+        and reproduces entry price, bar counters, PIP shape, and trailing
+        extreme exactly — unlike trusting saved counters, which silently
+        corrupt the hard stop and PIP exit when a restart loses context.
         """
         st = self.states[symbol]
         strat = self.strategies[symbol]
-        broker = self.broker
         try:
-            pos_amt = float(broker.position(symbol).get("positionAmt") or 0)
-        except Exception:
-            pos_amt = 0.0
+            pos_amt = float(self.broker.position(symbol).get("positionAmt") or 0)
+        except Exception as e:
+            self.tg.error(f"{symbol} restore: position query failed: {e}")
+            raise
         pos = _pos_side(pos_amt)
         if pos == 0:
             log.info("  %s 无持仓，跳过恢复", symbol)
             return
+        klines = self._fetch_klines(symbol, limit=self.cfg.lookback + self.cfg.hold + 10)
+        if len(klines) <= self.cfg.lookback:
+            self.tg.error(
+                f"{symbol} restore: kline history unavailable ({len(klines)} bars),"
+                " falling back to saved counters"
+            )
+            self._restore_from_saved(symbol)
+            return
+        closes = klines["close"].to_numpy(dtype=float)
+        fresh = FrozenMomentumStrategy(
+            lookback=self.cfg.lookback,
+            hold=self.cfg.hold,
+            mode=self.cfg.mode,
+            exit_mode=self.cfg.exit_mode,
+            pip_n=self.cfg.pip_n,
+            min_bars=self.cfg.min_bars,
+            fit_exit=self.cfg.fit_exit,
+            stop_pct=self.cfg.stop_pct,
+            trail_arm=self.cfg.trail_arm,
+            trail_giveback=self.cfg.trail_giveback,
+        )
+        last_bar = st.get("last_bar")
+        if last_bar:
+            proc_idx = _first_unprocessed_idx(klines, last_bar)
+            if proc_idx > 0:
+                # Replay exactly through the last bar already reflected in
+                # state; run_one_symbol then continues from proc_idx so no
+                # bar is ever counted twice.
+                fresh.replay_from(closes[:proc_idx], 0)
+            else:
+                # Saved bar older than the fetch window: rebuild through the
+                # newest closed bar and advance the watermark to it.
+                fresh.replay_from(closes, 0)
+                st["last_bar"] = str(klines.iloc[-1]["open_time"])
+        else:
+            fresh.replay_from(closes, 0)
+            st["last_bar"] = str(klines.iloc[-1]["open_time"])
+        strat.curr_sig = fresh.curr_sig
+        strat.hold_left = fresh.hold_left
+        strat.bars_in_trade = fresh.bars_in_trade
+        strat.entry_price = fresh.entry_price
+        strat.extreme = fresh.extreme
+        strat.pred_y = fresh.pred_y
+        strat.last_fit = fresh.last_fit
+        replay_side = int(np.sign(strat.curr_sig))
+        if replay_side != pos:
+            self.tg.error(
+                f"{symbol} restore mismatch: exchange pos {pos:+d} vs replay sig"
+                f" {replay_side:+d}; position will be reconciled next cycle"
+            )
+        # Persist the rebuilt watermark so a crash right after restore does
+        # not fall back to the stale saved one.
+        st["curr_sig"] = float(strat.curr_sig)
+        st["hold_left"] = strat.hold_left
+        st["bars_in_trade"] = strat.bars_in_trade
+        st["pred_y"] = [float(x) for x in strat.pred_y] if strat.pred_y is not None else None
+        st["extreme"] = strat.extreme
+        self._save_state(symbol, st)
+        log.info(
+            "  %s 恢复完成(重放 %d 根): pos=%d bars=%d hold_left=%d entry=%.4f extreme=%.4f",
+            symbol, len(closes), pos, strat.bars_in_trade, strat.hold_left,
+            strat.entry_price, strat.extreme,
+        )
+
+    def _restore_from_saved(self, symbol: str) -> None:
+        """Best-effort restore from saved counters (kline history unavailable)."""
+        st = self.states[symbol]
+        strat = self.strategies[symbol]
+        strat.curr_sig = float(st.get("curr_sig") or 0)
+        strat.hold_left = int(st.get("hold_left") or 0)
+        strat.bars_in_trade = int(st.get("bars_in_trade") or 0)
+        strat.entry_price = float(st.get("entry") or 0)
+        strat.extreme = float(st.get("extreme") or strat.entry_price)
+        pred = st.get("pred_y")
+        if pred:
+            strat.pred_y = [float(x) for x in pred]
         bar = st.get("last_bar")
         if bar:
-            try:
-                klines = self._fetch_klines(symbol, limit=100)
+            klines = self._fetch_klines(symbol, limit=100)
+            if not klines.empty:
                 idx = _first_unprocessed_idx(klines, bar)
-                closes = klines["close"].to_numpy(dtype=float)
-                strat.curr_sig = float(st.get("curr_sig") or 0)
-                strat.hold_left = int(st.get("hold_left") or 0)
-                strat.bars_in_trade = int(st.get("bars_in_trade") or 0)
-                strat.entry_price = float(st.get("entry") or 0)
-                strat.extreme = float(st.get("extreme") or strat.entry_price)
-                pred = st.get("pred_pips")
-                if pred:
-                    strat.pred_y = [float(p["y"]) for p in pred]
-                strat.replay_from(closes, idx)
-                log.info(
-                    "  %s 恢复完成: pos=%d bars=%d hold_left=%d",
-                    symbol, pos, strat.bars_in_trade, strat.hold_left,
-                )
+                strat.replay_from(klines["close"].to_numpy(dtype=float), idx)
+        log.info(
+            "  %s 恢复完成(存档回退): pos=%d bars=%d hold_left=%d",
+            symbol, _pos_side(strat.curr_sig), strat.bars_in_trade, strat.hold_left,
+        )
+
+    def _restore_all(self) -> None:
+        """Restore every symbol once per process, alerting on failures."""
+        for sym in self.symbols:
+            try:
+                self._restore_state(sym)
             except Exception as e:
-                log.warning("  %s 恢复失败: %s", symbol, e)
+                log.error("  %s restore failed: %s", sym, e)
+                self.tg.error(f"{sym} restore failed: {e}")
+            self._ensure_exchange_stop(sym)
+        self._restored = True
 
     def _fetch_klines(self, symbol: str, limit: int = 200) -> pd.DataFrame:
         """Fetch klines from broker, returning a DataFrame with standard columns."""
@@ -321,36 +410,112 @@ class RunLoop:
             symbol, side, qty, reduce_only=reduce_only, client_order_id=oid_str,
         )
 
+    def _cancel_stops(self, symbol: str) -> None:
+        """Cancel all open orders for the symbol (bot-managed only)."""
+        try:
+            self.broker.cancel_all_orders(symbol)
+        except Exception as e:
+            log.warning("  %s cancel stop orders failed: %s", symbol, e)
+
+    def _ensure_exchange_stop(self, symbol: str, pos_row: dict | None = None) -> None:
+        """Keep one catastrophic STOP_MARKET per open position.
+
+        Placed from the exchange-reported entry price so it is independent
+        of local state. Never places blindly: if the open-orders query
+        fails, it leaves the exchange-side stop absent rather than risk
+        duplicates, and alerts so the gap is visible.
+        """
+        if not (self.cfg.stop_pct and self.cfg.use_exchange_stop):
+            return
+        try:
+            if pos_row is None:
+                pos_row = self.broker.position(symbol)
+            amt = float(pos_row.get("positionAmt") or 0)
+        except Exception as e:
+            log.warning("  %s stop check: position query failed: %s", symbol, e)
+            return
+        side = _pos_side(amt)
+        if side == 0:
+            self._cancel_stops(symbol)
+            return
+        entry = float(pos_row.get("entryPrice") or 0)
+        if entry <= 0:
+            log.warning("  %s stop check: no entry price from exchange", symbol)
+            return
+        stop_px = self.broker.round_price(symbol, entry * (1.0 - self.cfg.stop_pct * side))
+        try:
+            existing = self.broker.open_orders(symbol)
+        except Exception as e:
+            log.warning("  %s stop check: open orders query failed: %s", symbol, e)
+            self.tg.error(f"{symbol} stop check failed (no exchange stop guaranteed): {e}")
+            return
+        has_stop = any(
+            str(o.get("type")) == "STOP_MARKET"
+            and str(o.get("closePosition")).lower() == "true"
+            for o in existing
+        )
+        if has_stop:
+            return
+        close_side = "SELL" if side > 0 else "BUY"
+        try:
+            self.broker.stop_market_close(symbol, close_side, stop_px)
+        except Exception as e:
+            log.error("  %s stop order failed: %s", symbol, e)
+            self.tg.error(f"{symbol} catastrophic stop placement failed: {e}")
+            return
+        log.info("  %s 挂交易所止损 %s STOP_MARKET @ %g", symbol, close_side, stop_px)
+        self.tg.stop_placed(symbol, close_side, stop_px)
+
+    @staticmethod
+    def _is_rate_limit(msg: str) -> bool:
+        low = str(msg).lower()
+        return "418" in low or "-1003" in low or "way too many requests" in low
+
     def run_one_symbol(self, symbol: str, equity: float) -> dict:
         """Process one bar for one symbol. Returns summary dict."""
         st = self.states[symbol]
         strat = self.strategies[symbol]
 
+        orders: list[dict] = []
+        results: dict = {"symbol": symbol, "orders": orders}
+
+        # Cheap probe first: skip the full history fetch (and the strategy
+        # replay) when no new closed bar has arrived.
+        if st.get("last_bar") is not None:
+            probe = self._fetch_klines(symbol, limit=2)
+            if probe.empty:
+                return {"symbol": symbol, "error": "no klines"}
+            if str(probe.iloc[-1]["open_time"]) == st.get("last_bar"):
+                log.debug("  %s 已处理 %s", symbol, st.get("last_bar"))
+                return results
+
         klines = self._fetch_klines(symbol, limit=self.cfg.lookback + 10)
         if klines.empty:
             return {"symbol": symbol, "error": "no klines"}
-
-        orders: list[dict] = []
-        results: dict = {"symbol": symbol, "orders": orders}
 
         bar_row = klines.iloc[-1]
         bar_id = str(bar_row["open_time"])
         mark = float(bar_row["close"])
 
         if st.get("last_bar") == bar_id:
-            log.debug("  %s 已处理 %s", symbol, bar_id)
             return results
 
         inject = st.get("last_bar") is None
         idx = _first_unprocessed_idx(klines, st.get("last_bar"))
         closes = klines["close"].to_numpy(dtype=float)
+        if not inject and idx == 0:
+            # Gap longer than the fetch window: pull the full trade-length
+            # history so the continuing replay stays exact.
+            klines = self._fetch_klines(symbol, limit=self.cfg.lookback + self.cfg.hold + 10)
+            if not klines.empty:
+                closes = klines["close"].to_numpy(dtype=float)
+                idx = _first_unprocessed_idx(klines, st.get("last_bar"))
 
-        # Run strategy
-        if inject:
-            strat.replay_from(closes, 0)
-        else:
-            for i in range(idx, len(closes)):
-                strat.on_bar_close(closes[: i + 1])
+        # Run strategy over the unprocessed bars only — restore already
+        # rebuilt state through the last processed bar, so replaying them
+        # again would double-count bars_in_trade/hold_left.
+        for i in range(idx, len(closes)):
+            strat.on_bar_close(closes[: i + 1])
         sig = strat.curr_sig
 
         # Risk guard: if halted, force target side to 0 (flatten on next step)
@@ -424,6 +589,7 @@ class RunLoop:
             st["qty"] = 0.0
             st["entry"] = 0.0
             st["extreme"] = 0.0
+            self._cancel_stops(symbol)
 
         # Open if we have a target but no position
         if target != 0 and current == 0 and self.risk.check(equity):
@@ -438,19 +604,15 @@ class RunLoop:
                 rec = send(open_side, qty, False, "OPEN")
                 self.tg.fills([rec])
                 log.info("  %s 开仓 %s qty=%g", symbol, open_side, qty)
-                # Record frozen prediction shape from the bar window
-                look = min(24, len(closes))
-                if look >= self.cfg.pip_n:
-                    from research.pips import find_pips
-
-                    _, py = find_pips(closes[-look:], self.cfg.pip_n, 3)
-                    st["pred_pips"] = [{"i": int(i), "y": float(y)} for i, y in zip(range(look), py, strict=False)]
                 st["pos"] = target
                 st["qty"] = qty
                 st["entry"] = mark
                 st["extreme"] = mark
                 st["hold_left"] = strat.hold_left
                 st["bars_in_trade"] = strat.bars_in_trade
+                # Catastrophic exchange-side stop, anchored to the real fill
+                # (fresh position query carries the exchange entryPrice).
+                self._ensure_exchange_stop(symbol)
 
         # Update state
         st["last_bar"] = bar_id
@@ -459,10 +621,10 @@ class RunLoop:
         st["bars_in_trade"] = strat.bars_in_trade
         st["n_steps"] = st.get("n_steps", 0) + 1
         st["last_fit"] = strat.last_fit
+        st["pred_y"] = [float(x) for x in strat.pred_y] if strat.pred_y is not None else None
+        st["extreme"] = strat.extreme
         st["mark"] = mark
         st["equity"] = equity
-        if st.get("pos"):
-            st["extreme"] = st.get("extreme") or st.get("entry") or 0.0
         self._save_state(symbol, st)
 
         _append_csv(
@@ -482,10 +644,20 @@ class RunLoop:
         )
         _append_csv(self.orders_path, orders, ORDER_COLUMNS)
 
+        if not orders:
+            # Nothing traded this cycle: pos_row is current, so use it to
+            # keep the exchange-side stop aligned (replace after external
+            # fills, clean up leftovers when flat).
+            self._ensure_exchange_stop(symbol, pos_row)
+
         return results
 
     def run_all(self) -> dict:
         """Process one bar for all symbols. Returns aggregated summary."""
+        if not getattr(self, "_restored", False):
+            # One-shot invocations (cron) must restore exactly like the
+            # long-running loop does before touching any position.
+            self._restore_all()
         summary: dict = {"symbols": {}, "orders": []}
         try:
             equity = self._refresh_equity()
@@ -556,26 +728,35 @@ class RunLoop:
         signal.signal(signal.SIGTERM, _stop)
         signal.signal(signal.SIGINT, _stop)
 
-        # Restore in-flight strategy state (PIP shape, entry, extreme) so a
-        # restart doesn't lose exit context for open positions.
-        for sym in self.symbols:
-            with contextlib.suppress(Exception):
-                self._restore_state(sym)
+        # Restore in-flight strategy state (entry, counters, PIP shape) so a
+        # restart doesn't lose exit context for open positions. run_all()
+        # also restores when invoked one-shot without run_loop().
+        self._restore_all()
 
         with contextlib.suppress(Exception):
             self.tg.online(self.snapshot())
 
         try:
             while True:
+                now = time.time()
+                if now < self._cooldown_until:
+                    log.warning(
+                        "rate-limit cooldown, resuming in %.0fs",
+                        self._cooldown_until - now,
+                    )
+                    time.sleep(min(60.0, self._cooldown_until - now))
+                    continue
                 try:
                     summary = self.run_all()
                     err = str(summary.get("error") or "")
                     if err:
-                        net = any(
+                        if self._is_rate_limit(err):
+                            self._cooldown_until = time.time() + 600.0
+                            self.tg.error(f"rate limited, cooling down 10 min: {err}")
+                        elif any(
                             x in err.lower()
                             for x in ("unreachable", "timeout", "timed out", "connection")
-                        )
-                        if net:
+                        ):
                             self.tg.disconnect(err)
                         else:
                             self.tg.reconnect()
@@ -588,6 +769,10 @@ class RunLoop:
                 except Exception as e:
                     log.error("step error: %s", e)
                     msg = str(e)
+                    if self._is_rate_limit(msg):
+                        self._cooldown_until = time.time() + 600.0
+                        self.tg.error(f"rate limited, cooling down 10 min: {msg}")
+                        continue
                     net = any(
                         x in msg.lower()
                         for x in ("unreachable", "timeout", "timed out", "connection")

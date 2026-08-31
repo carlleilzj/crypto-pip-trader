@@ -20,6 +20,7 @@ fit_exit: 0.0
 # Backtested on 3-coin portfolio (train 2020-2022 + OOS 2022-2026.08):
 # stop 6%: OOS ret +23.7% vs base +20.1%, max_dd -4.7% vs -4.8%, martin 11.6 vs 10.3
 stop_pct: 0.06       # hard stop: flatten on -6% from entry
+use_exchange_stop: true   # also place a reduce-close STOP_MARKET (mark price) on the exchange
 # trail_arm: 0.10      # trailing stop: arm after +10% profit (backtested: negative
 # trail_giveback: 0.05 # contribution on both train and OOS — keep disabled)
 

@@ -70,6 +70,7 @@ class PassedConfig:
     stop_pct: float | None = None
     trail_arm: float | None = None
     trail_giveback: float | None = None
+    use_exchange_stop: bool = True
     notional_frac: float = 0.25
     costs: CostConfig = field(default_factory=CostConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
@@ -120,6 +121,7 @@ class PassedConfig:
             stop_pct=_f(stop_pct, 0.0) if stop_pct is not None else None,
             trail_arm=_f(trail_arm, 0.0) if trail_arm is not None else None,
             trail_giveback=_f(trail_giveback, 0.0) if trail_giveback is not None else None,
+            use_exchange_stop=bool(d.get("use_exchange_stop", True)),
             notional_frac=_f(d.get("notional_frac"), 0.25),
             costs=costs,
             risk=risk,

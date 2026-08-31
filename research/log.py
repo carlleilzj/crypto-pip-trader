@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import logging.handlers
+import os
 import sys
 from pathlib import Path
 
@@ -19,6 +20,8 @@ def get_logger(name: str, log_dir: str | Path | None = None) -> logging.Logger:
 
     Safe to call multiple times — only adds handlers once per name.
     File handler writes to ``log_dir / {name}.log``, rotating at midnight.
+    Directory resolution: explicit arg > PIP_LOG_DIR env (tests set this so
+    logs stay out of reports/) > reports/logs.
     """
     logger = logging.getLogger(name)
     if logger.handlers:
@@ -39,7 +42,8 @@ def get_logger(name: str, log_dir: str | Path | None = None) -> logging.Logger:
     logger.addHandler(console)
 
     # File handler (DEBUG+) — optional
-    log_dir = Path(log_dir) if log_dir else REPORTS / "logs"
+    env_dir = os.environ.get("PIP_LOG_DIR")
+    log_dir = Path(log_dir) if log_dir else (Path(env_dir) if env_dir else REPORTS / "logs")
     log_dir.mkdir(parents=True, exist_ok=True)
     fh = logging.handlers.TimedRotatingFileHandler(
         log_dir / f"{name}.log",

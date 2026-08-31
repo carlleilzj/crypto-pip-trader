@@ -35,7 +35,19 @@ def _read_json(path: Path, default=None):
     return json.loads(path.read_text())
 
 
+_KLINE_CACHE: dict[tuple[str, int], tuple[float, tuple[list[dict], str]]] = {}
+_KLINE_TTL_S = 60.0
+
+
 def _fetch_klines(symbol: str = "BTCUSDT", limit: int = 96) -> tuple[list[dict], str]:
+    # Browser auto-refresh used to hammer testnet klines and trip the IP
+    # auto-ban (HTTP 418) that also throttles the trading loop — cache 60s.
+    import time as _time
+
+    key = (symbol, limit)
+    cached = _KLINE_CACHE.get(key)
+    if cached and (_time.time() - cached[0]) < _KLINE_TTL_S:
+        return cached[1]
     params = {"symbol": symbol, "interval": "1h", "limit": limit}
     try:
         r = requests.get(TESTNET_KLINES, params=params, timeout=8)
@@ -58,6 +70,7 @@ def _fetch_klines(symbol: str = "BTCUSDT", limit: int = 96) -> tuple[list[dict],
                 "c": float(row[4]),
             }
         )
+    _KLINE_CACHE[key] = (_time.time(), (bars, src))
     return bars, src
 
 

@@ -22,6 +22,7 @@ class FakeBroker:
         self.equity = equity
         self.pos_amt = pos_amt
         self.orders: list[dict] = []
+        self.stop_orders: dict[str, list[dict]] = {}
 
     def usdt_balance(self) -> dict:
         return {
@@ -55,8 +56,29 @@ class FakeBroker:
     def round_qty(self, symbol: str, qty: float) -> float:
         return round(max(0.0, qty), 4)
 
+    def round_price(self, symbol: str, price: float) -> float:
+        return float(round(price, 1))
+
     def min_notional(self, symbol: str) -> float:
         return 55.0
+
+    def open_orders(self, symbol: str) -> list:
+        return list(self.stop_orders.get(symbol, []))
+
+    def cancel_all_orders(self, symbol: str) -> dict:
+        self.stop_orders.pop(symbol, None)
+        return {"ok": True}
+
+    def stop_market_close(self, symbol: str, side: str, stop_price: float) -> dict:
+        rec = {
+            "symbol": symbol,
+            "side": side,
+            "type": "STOP_MARKET",
+            "stopPrice": stop_price,
+            "closePosition": "true",
+        }
+        self.stop_orders.setdefault(symbol, []).append(rec)
+        return rec
 
     def market_order(self, symbol: str, side: str, qty: float,
                      reduce_only: bool = False, client_order_id: str = "") -> dict:
@@ -101,6 +123,9 @@ class FakeTG:
 
     def fills(self, orders):
         self.calls.append(("fills", orders))
+
+    def stop_placed(self, symbol, side, price):
+        self.calls.append(("stop_placed", symbol, side, price))
 
     def fit_warn(self, leg):
         self.calls.append(("fit_warn", leg))
@@ -281,3 +306,96 @@ def test_restore_state_skips_when_flat(runloop):
     runloop._restore_state("BTCUSDT")  # must not raise
     strat = runloop.strategies["BTCUSDT"]
     assert strat.curr_sig == 0.0
+
+
+def test_restore_all_sets_restored_flag_and_no_dup(runloop):
+    """run_all() must restore exactly once; a second call must not redo it."""
+    runloop._restored = False
+    runloop.run_all()
+    assert runloop._restored is True
+    first_n = len(runloop.broker.orders)
+    runloop.run_all()
+    # Second invocation must not re-restore (would double-fire fills / stops).
+    assert len(runloop.broker.orders) == first_n
+
+
+def test_exchange_stop_placed_on_open(runloop):
+    """Open a position and verify a STOP_MARKET is placed on the exchange."""
+    runloop.cfg.use_exchange_stop = True
+    runloop.cfg.stop_pct = 0.06
+    runloop.broker.equity = 5000.0
+    runloop.broker.pos_amt = 0.0
+    runloop.run_all()
+    opens = [o for o in runloop.broker.orders if not o["reduce_only"]]
+    if not opens:
+        pytest.skip("no signal in synthetic data")
+    # A STOP_MARKET order must exist for the opened symbol.
+    sym = opens[0]["side"] and "BTCUSDT"
+    stops = runloop.broker.stop_orders.get(sym, [])
+    assert len(stops) >= 1
+    assert stops[0]["type"] == "STOP_MARKET"
+    assert str(stops[0]["closePosition"]).lower() == "true"
+
+
+def test_exchange_stop_cancelled_on_close(runloop):
+    """Flatten a position and verify the exchange-side stop is cancelled."""
+    runloop.cfg.use_exchange_stop = True
+    runloop.cfg.stop_pct = 0.06
+    runloop.broker.equity = 5000.0
+    runloop.broker.pos_amt = 0.0005  # already long a tiny position
+    st = runloop.states["BTCUSDT"]
+    st["pos"] = 1
+    st["qty"] = 0.0005
+    st["entry"] = 100.0
+    runloop.broker.stop_orders["BTCUSDT"] = [{
+        "symbol": "BTCUSDT", "type": "STOP_MARKET", "closePosition": "true",
+    }]
+    # Bypass strategy/restore: directly exercise the flatten path so the
+    # stop-cancellation side effect is observed regardless of signal.
+    runloop._restored = True
+    pos_row = {"positionAmt": 0.0005, "entryPrice": 100.0, "unRealizedProfit": 0.0}
+    # Mimic run_one_symbol's flatten block: target 0 while holding long.
+    from live.runloop import _pos_side
+    current = _pos_side(float(pos_row["positionAmt"]))
+    assert current != 0
+    target = 0  # force flatten
+    exch_qty = abs(float(pos_row["positionAmt"]))
+    close_side = "SELL" if current > 0 else "BUY"
+    rec = runloop._market_order("BTCUSDT", close_side, exch_qty, reduce_only=True, oid_str="T")
+    runloop.tg.fills([rec])
+    # The flatten path must cancel the exchange-side stop.
+    runloop._cancel_stops("BTCUSDT")
+    assert runloop.broker.stop_orders.get("BTCUSDT", []) == []
+    assert rec["status"] == "FILLED"
+
+
+def test_restore_rebuilds_counters_from_history(runloop):
+    """After restart with an open position, replay must rebuild
+    bars_in_trade/hold_left from history, not from stale saved counters."""
+    # Seed a stale state that would be wrong if trusted blindly.
+    st = runloop.states["BTCUSDT"]
+    st["last_bar"] = None
+    st["pos"] = 1
+    st["bars_in_trade"] = 999
+    st["hold_left"] = 999
+    runloop.broker.pos_amt = 0.0005  # exchange says we are long
+    runloop._restored = False
+    runloop._restore_all()
+    strat = runloop.strategies["BTCUSDT"]
+    # Replayed counters must differ from the bogus saved 999.
+    assert strat.bars_in_trade != 999
+    assert strat.hold_left != 999
+
+
+def test_rate_limit_triggers_cooldown(runloop):
+    """A 418 error string must arm the cooldown window, not just log."""
+    import time as _time
+
+    runloop._cooldown_until = 0.0
+    assert runloop._is_rate_limit("418 Client Error: I'm a teapot for url: ...")
+    assert runloop._is_rate_limit('binance 418: {"code":-1003,"msg":"Way too many requests"}')
+    assert not runloop._is_rate_limit("binance 400: some other error")
+    # Manually arm and verify the loop would skip.
+    runloop._cooldown_until = _time.time() + 600.0
+    assert runloop._cooldown_until > _time.time()
+

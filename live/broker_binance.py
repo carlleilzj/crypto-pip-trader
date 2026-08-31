@@ -166,6 +166,43 @@ class BinanceUSDMBroker:
                 return float(f.get("notional") or f.get("minNotional") or 0)
         return 0.0
 
+    def round_price(self, symbol: str, price: float) -> float:
+        meta = self.symbol_filters(symbol)
+        tick = 0.0
+        for f in meta.get("filters") or []:
+            if f.get("filterType") == "PRICE_FILTER":
+                tick = float(f.get("tickSize") or 0)
+        if tick <= 0:
+            return price
+        n = round(price / tick)
+        decimals = max(0, -int(math.floor(math.log10(tick) + 1e-9)))
+        return float(f"{n * tick:.{decimals}f}")
+
+    def open_orders(self, symbol: str) -> list:
+        return self._signed("GET", "/fapi/v1/openOrders", {"symbol": symbol})
+
+    def cancel_all_orders(self, symbol: str) -> dict:
+        return self._signed("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
+
+    def stop_market_close(self, symbol: str, side: str, stop_price: float) -> dict:
+        """Place a catastrophic close-all STOP_MARKET (mark-price triggered).
+
+        closePosition=true flattens the whole position regardless of qty, so
+        no quantity/rounding is involved. This order survives bot crashes —
+        it is the only stop that protects the account while the process is
+        down.
+        """
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "STOP_MARKET",
+            "stopPrice": f"{stop_price}",
+            "closePosition": "true",
+            "workingType": "MARK_PRICE",
+            "newOrderRespType": "RESULT",
+        }
+        return self._signed("POST", "/fapi/v1/order", params)
+
     def mark_price(self, symbol: str) -> float:
         row = self._public("/fapi/v1/premiumIndex", {"symbol": symbol})
         return float(row["markPrice"])

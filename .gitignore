@@ -26,6 +26,8 @@ reports/*
 !reports/.gitkeep
 
 data/_cache/
+data/*.csv
+!data/.gitkeep
 
 # Compiled
 *.so
