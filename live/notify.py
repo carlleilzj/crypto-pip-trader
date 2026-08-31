@@ -243,10 +243,16 @@ class TelegramNotifier:
         return {"last": {}, "disconnected": False, "halted": False, "fit_warn": {}}
 
     def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.state, indent=2, default=float))
-        tmp.replace(self.path)
+        """Persist notify state. Never raise — a save failure must not
+        take down the trading loop. Falls back to stderr so the gap is
+        visible in journald instead of crashing the process."""
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.state, indent=2, default=float))
+            tmp.replace(self.path)
+        except Exception as e:
+            print(f"notify _save failed: {e}", flush=True)
 
     def _cooled(self, key: str, cooldown_s: float) -> bool:
         if cooldown_s <= 0:

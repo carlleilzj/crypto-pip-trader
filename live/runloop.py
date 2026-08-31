@@ -427,6 +427,8 @@ class RunLoop:
         """
         if not (self.cfg.stop_pct and self.cfg.use_exchange_stop):
             return
+        if getattr(self, "_stop_unsupported", False):
+            return
         try:
             if pos_row is None:
                 pos_row = self.broker.position(symbol)
@@ -460,8 +462,21 @@ class RunLoop:
         try:
             self.broker.stop_market_close(symbol, close_side, stop_px)
         except Exception as e:
-            log.error("  %s stop order failed: %s", symbol, e)
-            self.tg.error(f"{symbol} catastrophic stop placement failed: {e}")
+            estr = str(e)
+            if "4120" in estr or "not supported" in estr.lower():
+                # Testnet rejects STOP_MARKET (Algo Order endpoint only).
+                # Degrade silently after one alert: the in-process 6% stop
+                # still protects the position; just no crash-safety net.
+                if not getattr(self, "_stop_unsupported", False):
+                    self._stop_unsupported = True
+                    log.warning("  %s STOP_MARKET not supported by venue, degrading", symbol)
+                    self.tg.error(
+                        f"{symbol} exchange STOP_MARKET unsupported by venue;"
+                        " relying on in-process stop only"
+                    )
+            else:
+                log.error("  %s stop order failed: %s", symbol, e)
+                self.tg.error(f"{symbol} catastrophic stop placement failed: {e}")
             return
         log.info("  %s 挂交易所止损 %s STOP_MARKET @ %g", symbol, close_side, stop_px)
         self.tg.stop_placed(symbol, close_side, stop_px)
