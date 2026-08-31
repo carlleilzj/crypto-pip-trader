@@ -33,7 +33,7 @@ BTCUSDT USDT-M 永续。原 PIP+K-Means 形态挖掘已证伪；通过门禁的�
 
 - **交易所侧灾难止损**：开仓同时挂 `STOP_MARKET`（`closePosition=true`，mark 价触发），进程宕机时仍生效。平仓时自动撤销。见 `live/broker_binance.py:stop_market_close`。
 - **状态恢复**：进程重启后从全量 K 线重放重建策略状态（`entry / bars_in_trade / hold_left / extreme / pred_y`），不再信任存档计数器；恢复失败发 Telegram。见 `live/runloop.py:_restore_state`。
-- **限频退避**：418/-1003 触发 10 分钟冷却，dashboard K 线缓存 60 秒。
+- **限频退避**：418/-1003 触发 10 分钟冷却，新 K 线探测只拉 2 根。
 
 ## 流程
 
@@ -69,12 +69,12 @@ python scripts/run_testnet.py
 
 `run_testnet.py` 会在 Testnet 发真实市价单（单向持仓、isolated、杠杆≤2）。Key 只走环境变量，禁止写入仓库。主网下单未实现。
 
-看日志 / 看板：
+看日志：
 
 ```bash
 cat reports/live_paper_state.json
 tail -20 reports/live_paper_log.csv
-python scripts/serve_dashboard.py   # http://127.0.0.1:8765
+cat reports/logs/runloop.log
 ```
 
 ## 已跑对照
