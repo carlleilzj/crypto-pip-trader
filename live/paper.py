@@ -87,11 +87,18 @@ class PaperBroker:
         self.entry = 0.0
         return [order]
 
-    def _open_position(self, side: int, price: float, risk: RiskGuard, bar: str) -> list[SimulatedOrder]:
-        """Open a new position on the given side. Returns list of order(s)."""
+    def _open_position(self, side: int, price: float, risk: RiskGuard, bar: str,
+                       portfolio_equity: float | None = None) -> list[SimulatedOrder]:
+        """Open a new position on the given side. Returns list of order(s).
+
+        ``portfolio_equity`` (when set) is used for the risk-guard check so a
+        per-coin broker in a multi-coin portfolio doesn't trip the portfolio
+        drawdown halt using only its own sub-capital. ``self.equity`` is still
+        used for sizing (qty = sub-capital * frac / price).
+        """
         now = datetime.now(UTC).isoformat()
-        mark_eq = self.equity  # after close, equity is current
-        if not risk.check(mark_eq):
+        check_eq = portfolio_equity if portfolio_equity is not None else self.equity
+        if not risk.check(check_eq):
             return []
         fill = self.cost.fill_price(price, side)
         q = risk.target_qty(self.equity, fill)
@@ -122,11 +129,12 @@ class PaperBroker:
         self.entry = fill
         return [order]
 
-    def set_position(self, side: int, price: float, risk: RiskGuard, bar: str = "") -> list[SimulatedOrder]:
+    def set_position(self, side: int, price: float, risk: RiskGuard, bar: str = "",
+                     portfolio_equity: float | None = None) -> list[SimulatedOrder]:
         """Set position to the given side (+, -, 0). Flattens first if needed."""
         self.last_orders = []
         orders = self._close_position(price, bar)
         if side != 0:
-            orders += self._open_position(side, price, risk, bar)
+            orders += self._open_position(side, price, risk, bar, portfolio_equity)
         self.last_orders = orders
         return orders

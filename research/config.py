@@ -60,7 +60,11 @@ class PassedConfig:
     interval: str = "1h"
     market: str = "usdm"
     strategy: str = ""
+    signal: str = "momentum"  # "momentum" | "ema" | "breakout"
     lookback: int = 720
+    n: int = 40  # breakout window (signal=breakout)
+    fast: int = 20  # EMA fast (signal=ema)
+    slow: int = 200  # EMA slow (signal=ema)
     hold: int = 720
     mode: str = "long_short"
     exit_mode: str = "pip"
@@ -111,7 +115,11 @@ class PassedConfig:
             interval=_s(d.get("interval"), "1h"),
             market=_s(d.get("market"), "usdm"),
             strategy=_s(d.get("strategy"), ""),
+            signal=_s(d.get("signal"), "momentum"),
             lookback=_i(d.get("lookback"), 720),
+            n=_i(d.get("n"), 40),
+            fast=_i(d.get("fast"), 20),
+            slow=_i(d.get("slow"), 200),
             hold=_i(d.get("hold"), 720),
             mode=_s(d.get("mode"), "long_short"),
             exit_mode=_s(d.get("exit_mode"), "pip"),

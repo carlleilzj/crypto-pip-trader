@@ -121,9 +121,15 @@ def main() -> None:
             sym, bars, agree, diff, r_r.summary["return"], r_l.summary["return"],
         )
 
-    # Combined portfolio equity
-    combined_r = np.sum(research_equities, axis=0) if research_equities else np.array([])
-    combined_l = np.sum(live_equities, axis=0) if live_equities else np.array([])
+    # Combined portfolio equity. Symbols have different OOS lengths
+    # (BTC 40632 / ETH 40824 / SOL 34529 bars), so a raw np.sum along axis=0
+    # raises "inhomogeneous shape". Truncate to the shortest length and sum.
+    combined_r = np.array([])
+    combined_l = np.array([])
+    if research_equities and live_equities:
+        min_len = min(len(e) for e in research_equities + live_equities)
+        combined_r = np.sum([e[:min_len] for e in research_equities], axis=0)
+        combined_l = np.sum([e[:min_len] for e in live_equities], axis=0)
     log.info("")
     combined_ret_l = float(combined_l[-1] / total_capital - 1.0) if len(combined_l) else 0.0
     combined_dd_l = max_drawdown(combined_l) if len(combined_l) else 0.0
@@ -158,6 +164,13 @@ def main() -> None:
         json.dumps(summary, indent=2, default=float)
     )
     log.info("结果已保存到 %s/paper_summary.json", report_dir)
+
+    # The research (vectorized) and live (stateful) signal paths MUST agree
+    # bar-for-bar. If they don't, the gate metrics are computed on a signal
+    # the live bot never trades — fail loudly so CI catches regressions.
+    if not sig_agree_all:
+        log.error("信号一致率 < 100%%，回测/实盘语义漂移，拒绝接受")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

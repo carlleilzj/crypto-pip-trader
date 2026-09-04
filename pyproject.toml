@@ -44,6 +44,6 @@ select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "ARG"]
 "tests/*" = ["ARG", "F841"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 strict = false
 ignore_missing_imports = true

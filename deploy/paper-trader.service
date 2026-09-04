@@ -1,0 +1,19 @@
+[Unit]
+Description=crypto-pip-trader public-market paper trading (3-coin breakout)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=piptrader
+Group=piptrader
+WorkingDirectory=/opt/crypto-pip-trader
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/crypto-pip-trader/.venv/bin/python scripts/run_live_paper.py --loop 60
+Restart=always
+RestartSec=15
+MemoryMax=256M
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

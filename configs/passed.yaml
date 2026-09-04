@@ -1,4 +1,12 @@
-# Frozen after P0 gate pass. Do not retune against OOS.
+# Frozen after breakout gate pass (2026-08-31). Do not retune against OOS.
+#
+# Strategy changed from 30d time-momentum to N-bar breakout entry after the
+# parity fix showed momentum (p=0.066) and EMA crossover (p=0.347) failed the
+# block-permutation gate. Breakout N=40 passes: ret +19.2%, Martin 4.70,
+# dd -6.7%, beats buy&hold (-11.4%), block-perm p=0.0488 (n=40) / 0.0149 (n=200).
+#
+# Calibrated on train 2020-2021 (N=40 by combined Calmar), validated 2022-2024.06,
+# final verdict on full OOS 2022-01→2026-08.
 symbol: BTCUSDT
 symbols:
   - BTCUSDT
@@ -7,8 +15,9 @@ symbols:
 interval: 1h
 market: usdm
 
-strategy: mom_30d_cal20_pip_exit
-lookback: 720
+strategy: breakout_n40_pip_exit
+signal: breakout
+n: 40                 # breakout window: close breaks rolling N-bar high/low
 hold: 720
 mode: long_short
 exit_mode: pip
@@ -16,13 +25,10 @@ pip_n: 5
 min_bars: 24
 fit_exit: 0.0
 
-# Stop-loss and trailing stop (applied in live execution)
-# Backtested on 3-coin portfolio (train 2020-2022 + OOS 2022-2026.08):
-# stop 6%: OOS ret +23.7% vs base +20.1%, max_dd -4.7% vs -4.8%, martin 11.6 vs 10.3
-stop_pct: 0.06       # hard stop: flatten on -6% from entry
+# Stop-loss (applied in live execution). Diagnostic showed PIP+stop is the
+# core edge: pure time exit BTC train +0.3% vs +77% with PIP+stop.
+stop_pct: 0.06        # hard stop: flatten on -6% from entry
 use_exchange_stop: true   # also place a reduce-close STOP_MARKET (mark price) on the exchange
-# trail_arm: 0.10      # trailing stop: arm after +10% profit (backtested: negative
-# trail_giveback: 0.05 # contribution on both train and OOS — keep disabled)
 
 notional_frac: 0.24489269335696373
 calibrated_from:

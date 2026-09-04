@@ -16,6 +16,10 @@ def martin_ratio(log_rets: np.ndarray) -> float:
     if len(rets) == 0 or rsum == 0.0:
         return 0.0
     csum = np.cumsum(rets)
+    # Normalise the cumulative log-return to start at 0 so exp() can't overflow
+    # on long series with large total return (e.g. 3-coin portfolio equity).
+    # Martin is scale-invariant, so shifting csum by a constant is safe.
+    csum = csum - csum[0]
     eq = np.exp(csum)
     peak = np.maximum.accumulate(eq)
     dd = (eq / peak) - 1.0

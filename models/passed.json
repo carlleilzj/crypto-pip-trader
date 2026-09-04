@@ -1,22 +1,45 @@
 {
-  "strategy": "mom_30d_cal20_pip_exit",
+  "strategy": "breakout_n40_pip_exit",
+  "signal": "breakout",
   "symbol": "BTCUSDT",
   "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
   "interval": "1h",
-  "lookback": 720,
+  "n": 40,
   "hold": 720,
   "mode": "long_short",
   "exit_mode": "pip",
   "pip_n": 5,
   "min_bars": 24,
   "fit_exit": 0.0,
+  "stop_pct": 0.06,
   "notional_frac": 0.24489269335696373,
-  "train_hours": 17520,
-  "train_dd": -0.408,
-  "target_dd": 0.20,
-  "oos_return": 0.201448,
-  "oos_martin": 10.2515,
-  "oos_max_dd": -0.048316,
-  "p_block168": 0.047619047619047616,
-  "n_trades": 58
+  "calibrated_from": {
+    "train_hours": 17520,
+    "train_dd": -0.408,
+    "target_dd": 0.20,
+    "base_frac": 0.5
+  },
+  "train_window": "2020-01-01 to 2021-12-31",
+  "val_window": "2022-01-01 to 2024-06-30",
+  "oos_window": "2022-01-01 to 2026-08-19",
+  "holdout_window": "2024-07-01 to 2026-08-27",
+  "oos_return": 0.1916,
+  "oos_martin": 4.70,
+  "oos_max_dd": -0.067,
+  "oos_trades": 1230,
+  "bh_return": -0.114,
+  "bh_max_dd": -0.771,
+  "p_block168_n40": 0.0488,
+  "p_block168_n200": 0.0149,
+  "per_coin_oos": {
+    "BTCUSDT": {"return": 0.147, "max_dd": -0.045},
+    "ETHUSDT": {"return": 0.181, "max_dd": -0.067},
+    "SOLUSDT": {"return": 0.305, "max_dd": -0.126}
+  },
+  "gate_history": {
+    "30d_momentum_parity_fixed": {"p": 0.066, "result": "FAIL (beats_buy_hold)"},
+    "ema_crossover": {"p": 0.347, "result": "FAIL (not significant)"},
+    "breakout_n40": {"p": 0.0488, "result": "PASS (all 6 criteria)"}
+  },
+  "frozen_date": "2026-08-31"
 }

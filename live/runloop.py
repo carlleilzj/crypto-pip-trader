@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
 import signal
 import time
 from collections.abc import Callable
@@ -20,7 +21,7 @@ import pandas as pd
 from live.broker_binance import KLINE_COLS
 from live.notify import TelegramNotifier
 from live.risk import RiskGuard
-from live.strategy import FrozenMomentumStrategy
+from live.strategy import make_strategy
 from research.config import PassedConfig
 from research.log import get_logger
 
@@ -33,6 +34,11 @@ ORDER_COLUMNS = [
     "client_order_id", "exchange_id", "bar", "symbol", "side", "action",
     "reduce_only", "qty", "avg_price", "status", "ts", "pnl", "pnl_pct",
 ]
+
+# Binance auto-ban messages carry an explicit "banned until <epoch-ms>"
+# timestamp; honoring it beats a fixed cooldown because further requests
+# during a ban extend the ban.
+_BAN_UNTIL_RE = re.compile(r"banned until (\d+)")
 
 
 def _first_unprocessed_idx(klines: pd.DataFrame, last_bar: str | None) -> int:
@@ -86,6 +92,14 @@ def _pos_side(amt: float) -> int:
     if amt < -1e-12:
         return -1
     return 0
+
+
+class RateLimitedError(RuntimeError):
+    """Raised when a data fetch hits a Binance rate limit / auto-ban.
+
+    Carries the venue message so the run loop can arm a ban-aware cooldown
+    instead of treating the fetch as an ordinary empty response.
+    """
 
 
 def _oid(seq: int, kind: str, symbol: str) -> str:
@@ -146,7 +160,12 @@ class RunLoop:
 
         self.account: dict = self._load_account()
         self._restored = False
-        self._cooldown_until = 0.0
+        self._cooldown_until = float(self.account.get("cooldown_until") or 0.0)
+        if self._cooldown_until > time.time():
+            log.warning(
+                "restored rate-limit cooldown from disk: %.0fs remaining",
+                self._cooldown_until - time.time(),
+            )
         self.risk = RiskGuard(
             notional_frac=self.frac_each,
             max_leverage=float(config.risk.max_leverage),
@@ -158,21 +177,10 @@ class RunLoop:
             halt_reason=str(self.account.get("halt_reason") or ""),
         )
 
-        self.strategies: dict[str, FrozenMomentumStrategy] = {}
+        self.strategies: dict[str, Any] = {}
         self.states: dict[str, dict] = {}
         for sym in self.symbols:
-            self.strategies[sym] = FrozenMomentumStrategy(
-                lookback=config.lookback,
-                hold=config.hold,
-                mode=config.mode,
-                exit_mode=config.exit_mode,
-                pip_n=config.pip_n,
-                min_bars=config.min_bars,
-                fit_exit=config.fit_exit,
-                stop_pct=config.stop_pct,
-                trail_arm=config.trail_arm,
-                trail_giveback=config.trail_giveback,
-            )
+            self.strategies[sym] = make_strategy(config)
             self.states[sym] = self._load_state(sym)
 
     def _state_path(self, symbol: str) -> Path:
@@ -296,18 +304,7 @@ class RunLoop:
             self._restore_from_saved(symbol)
             return
         closes = klines["close"].to_numpy(dtype=float)
-        fresh = FrozenMomentumStrategy(
-            lookback=self.cfg.lookback,
-            hold=self.cfg.hold,
-            mode=self.cfg.mode,
-            exit_mode=self.cfg.exit_mode,
-            pip_n=self.cfg.pip_n,
-            min_bars=self.cfg.min_bars,
-            fit_exit=self.cfg.fit_exit,
-            stop_pct=self.cfg.stop_pct,
-            trail_arm=self.cfg.trail_arm,
-            trail_giveback=self.cfg.trail_giveback,
-        )
+        fresh = make_strategy(self.cfg)
         last_bar = st.get("last_bar")
         if last_bar:
             proc_idx = _first_unprocessed_idx(klines, last_bar)
@@ -375,7 +372,23 @@ class RunLoop:
         )
 
     def _restore_all(self) -> None:
-        """Restore every symbol once per process, alerting on failures."""
+        """Restore every symbol once per process, alerting on failures.
+
+        Must never run while a rate-limit cooldown is active: restore fires
+        position/kline queries per symbol, and requests during a Binance
+        auto-ban extend the ban. If armed, wait it out here — run_loop's
+        cooldown branch handles the post-restore cycle pacing, but the very
+        first restore happens before that branch, so it needs its own gate.
+        """
+        if self._cooldown_until > time.time():
+            wait = self._cooldown_until - time.time()
+            log.warning("restore deferred %.0fs: rate-limit cooldown active", wait)
+            with contextlib.suppress(Exception):
+                self.tg.error(
+                    f"restore deferred {wait / 60:.0f} min: rate-limit cooldown active"
+                )
+            while self._cooldown_until > time.time():
+                time.sleep(min(30.0, self._cooldown_until - time.time()))
         for sym in self.symbols:
             try:
                 self._restore_state(sym)
@@ -385,11 +398,48 @@ class RunLoop:
             self._ensure_exchange_stop(sym)
         self._restored = True
 
+    def _arm_cooldown(self, msg: str, base_s: float = 600.0) -> None:
+        """Arm the rate-limit cooldown, honoring an explicit ban deadline.
+
+        Binance auto-ban (418/-1003) replies carry 'banned until <epoch-ms>';
+        sleeping exactly until then matters because requests made during a
+        ban extend it. Backoff doubles on repeat hits that carry no deadline
+        (429-style) instead of re-arming the same fixed window.
+        """
+        ban_ms = self._ban_until_ms(msg)
+        if ban_ms > 0:
+            until = ban_ms / 1000.0 + 5.0  # small margin past the stated end
+        else:
+            prev = max(0.0, self._cooldown_until - time.time())
+            until = time.time() + base_s + prev  # exponential-ish backoff
+        if until > self._cooldown_until:
+            self._cooldown_until = until
+        # Persist so a systemd restart (crash, OOM, operator) during a long
+        # ban doesn't fire _restore_all() requests straight into the ban and
+        # extend it — the exact mechanism that escalated the 2026-09-04 ban
+        # from ~14 min to a ~63-min-remaining penalty.
+        self.account["cooldown_until"] = self._cooldown_until
+        with contextlib.suppress(Exception):
+            self._save_account()
+        log.warning(
+            "rate-limit cooldown armed until %.0f (%.0fs)",
+            self._cooldown_until,
+            max(0.0, self._cooldown_until - time.time()),
+        )
+
     def _fetch_klines(self, symbol: str, limit: int = 200) -> pd.DataFrame:
-        """Fetch klines from broker, returning a DataFrame with standard columns."""
+        """Fetch klines from broker, returning a DataFrame with standard columns.
+
+        A rate-limited fetch must not be swallowed as 'no klines': re-raise
+        a marker so the caller aborts the cycle and arms the cooldown —
+        continuing to poll other symbols during a ban only extends it.
+        """
         try:
             raw = self.broker.klines(symbol, self.cfg.interval, limit=limit)
         except Exception as e:
+            estr = str(e)
+            if self._is_rate_limit(estr):
+                raise RateLimitedError(estr) from e
             log.warning("  %s klines fetch failed: %s", symbol, e)
             return pd.DataFrame()
         klines = pd.DataFrame(raw, columns=KLINE_COLS)
@@ -484,7 +534,19 @@ class RunLoop:
     @staticmethod
     def _is_rate_limit(msg: str) -> bool:
         low = str(msg).lower()
-        return "418" in low or "-1003" in low or "way too many requests" in low
+        return (
+            "418" in low
+            or "429" in low
+            or "-1003" in low
+            or "way too many requests" in low
+            or "banned until" in low
+        )
+
+    @staticmethod
+    def _ban_until_ms(msg: str) -> float:
+        """Epoch-ms the ban lifts, parsed from 'banned until <ms>'; 0 if absent."""
+        m = _BAN_UNTIL_RE.search(str(msg))
+        return float(m.group(1)) if m else 0.0
 
     def run_one_symbol(self, symbol: str, equity: float) -> dict:
         """Process one bar for one symbol. Returns summary dict."""
@@ -495,7 +557,8 @@ class RunLoop:
         results: dict = {"symbol": symbol, "orders": orders}
 
         # Cheap probe first: skip the full history fetch (and the strategy
-        # replay) when no new closed bar has arrived.
+        # replay) when no new closed bar has arrived. A rate-limited probe
+        # propagates so the cycle aborts before hammering the venue further.
         if st.get("last_bar") is not None:
             probe = self._fetch_klines(symbol, limit=2)
             if probe.empty:
@@ -683,6 +746,11 @@ class RunLoop:
                 res = self.run_one_symbol(sym, equity)
                 summary["symbols"][sym] = res
                 summary["orders"].extend(res.get("orders", []))
+            except RateLimitedError as e:
+                # Stop the whole cycle: further requests during a ban extend it.
+                summary["symbols"][sym] = {"symbol": sym, "error": str(e)}
+                summary["error"] = str(e)
+                return summary
             except Exception as e:
                 log.error("  %s error: %s", sym, e)
                 summary["symbols"][sym] = {"symbol": sym, "error": str(e)}
@@ -766,8 +834,8 @@ class RunLoop:
                     err = str(summary.get("error") or "")
                     if err:
                         if self._is_rate_limit(err):
-                            self._cooldown_until = time.time() + 600.0
-                            self.tg.error(f"rate limited, cooling down 10 min: {err}")
+                            self._arm_cooldown(err)
+                            self.tg.error(f"rate limited, cooling down: {err}")
                         elif any(
                             x in err.lower()
                             for x in ("unreachable", "timeout", "timed out", "connection")
@@ -785,8 +853,8 @@ class RunLoop:
                     log.error("step error: %s", e)
                     msg = str(e)
                     if self._is_rate_limit(msg):
-                        self._cooldown_until = time.time() + 600.0
-                        self.tg.error(f"rate limited, cooling down 10 min: {msg}")
+                        self._arm_cooldown(msg)
+                        self.tg.error(f"rate limited, cooling down: {msg}")
                         continue
                     net = any(
                         x in msg.lower()

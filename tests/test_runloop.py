@@ -185,6 +185,8 @@ def runloop(tmp_path):
     rl.orders_path = rl.report_dir / "testnet_orders.csv"
     rl.account_path = rl.report_dir / "testnet_account.json"
     rl.account = rl._load_account()
+    rl._restored = False
+    rl._cooldown_until = 0.0
     from live.risk import RiskGuard
 
     rl.risk = RiskGuard(
@@ -394,8 +396,83 @@ def test_rate_limit_triggers_cooldown(runloop):
     runloop._cooldown_until = 0.0
     assert runloop._is_rate_limit("418 Client Error: I'm a teapot for url: ...")
     assert runloop._is_rate_limit('binance 418: {"code":-1003,"msg":"Way too many requests"}')
+    assert runloop._is_rate_limit('binance 429: {"code":-1003,"msg":"Too many requests"}')
     assert not runloop._is_rate_limit("binance 400: some other error")
     # Manually arm and verify the loop would skip.
     runloop._cooldown_until = _time.time() + 600.0
     assert runloop._cooldown_until > _time.time()
+
+
+def test_cooldown_honors_ban_deadline(runloop):
+    """'banned until <ms>' must sleep until the stated end, not a fixed 10 min."""
+    import time as _time
+
+    runloop._cooldown_until = 0.0
+    until_ms = (_time.time() + 14 * 60.0) * 1000.0
+    runloop._arm_cooldown(f'banned until {int(until_ms)}. Please use the websocket.')
+    remaining = runloop._cooldown_until - _time.time()
+    # ~14 min (the ban), not the 10-min default and not zero.
+    assert 13 * 60.0 < remaining <= 14.1 * 60.0
+
+
+def test_cooldown_backs_off_without_deadline(runloop):
+    """Repeat hits with no ban deadline must grow the window, not reset it."""
+    import time as _time
+
+    runloop._cooldown_until = 0.0
+    runloop._arm_cooldown('binance 429: too many requests')
+    first = runloop._cooldown_until - _time.time()
+    runloop._arm_cooldown('binance 429: too many requests')
+    second = runloop._cooldown_until - _time.time()
+    assert second > first  # 600 + previous remainder = longer window
+
+
+def test_rate_limited_klines_abort_cycle(runloop):
+    """A 418 during kline fetch must abort run_all, not yield 'no klines'."""
+    from live.runloop import RateLimitedError
+
+    def boom(*a, **k):
+        raise RuntimeError('binance 418: {"code":-1003,"msg":"Way too many requests; IP banned until 1788489836895"}')
+
+    runloop._restored = True
+    runloop.broker.klines = boom
+    with pytest.raises(RateLimitedError):
+        runloop.run_one_symbol("BTCUSDT", 5000.0)
+    summary = runloop.run_all()
+    assert "418" in summary["error"]
+    assert runloop._is_rate_limit(summary["error"])
+
+
+def test_cooldown_persists_across_restart(runloop):
+    """Armed cooldown must survive a restart so restore doesn't hit a live ban."""
+    import time as _time
+
+    runloop._cooldown_until = 0.0
+    until_ms = (_time.time() + 30 * 60.0) * 1000.0
+    runloop._arm_cooldown(f'banned until {int(until_ms)}')
+    assert runloop.account["cooldown_until"] == pytest.approx(runloop._cooldown_until)
+    # Simulate restart: account file reloaded from disk carries the deadline.
+    import json as _json
+
+    disk = _json.loads(runloop.account_path.read_text())
+    assert disk["cooldown_until"] > _time.time()
+
+
+def test_restore_defers_until_cooldown_expires(runloop):
+    """_restore_all must wait out an active cooldown before any broker call."""
+    import time as _time
+
+    calls = {"restore": 0}
+    runloop._cooldown_until = _time.time() + 1.0  # short wait for the test
+
+    orig = runloop._restore_state
+
+    def counting(sym):
+        calls["restore"] += 1
+        orig(sym)
+
+    runloop._restore_state = counting
+    runloop._restore_all()
+    assert calls["restore"] == len(runloop.symbols)
+    assert runloop._cooldown_until <= _time.time()
 

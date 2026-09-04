@@ -179,7 +179,8 @@ class BinanceUSDMBroker:
         return float(f"{n * tick:.{decimals}f}")
 
     def open_orders(self, symbol: str) -> list:
-        return self._signed("GET", "/fapi/v1/openOrders", {"symbol": symbol})
+        rows = self._signed("GET", "/fapi/v1/openOrders", {"symbol": symbol})
+        return rows if isinstance(rows, list) else []
 
     def cancel_all_orders(self, symbol: str) -> dict:
         return self._signed("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})

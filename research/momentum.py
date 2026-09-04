@@ -51,7 +51,11 @@ def ts_momentum_signals(
             side = -1.0
         end = min(i + hold, n)
         sig[i:end] = side
-        i = end
+        # Exit-then-flat-next-bar: the stateful strategy returns 0 on the
+        # bar after hold expires and only re-enters the following bar, so
+        # the vectorized baseline must skip one bar too (otherwise it could
+        # reverse direction on the same bar the live path is still flat).
+        i = end + 1
     return sig
 
 
@@ -127,7 +131,12 @@ def ts_momentum_pip_exit(
                         exit_i = j
                         break
         sig[i:exit_i] = side
-        i = exit_i if exit_i > i else i + 1
+        # Exit-then-flat-next-bar: align with the stateful live strategy,
+        # whose on_bar_close returns 0.0 on the exit bar and cannot re-enter
+        # until the next bar. Without the +1 here, the vectorized path could
+        # reverse (long->short) on the same bar it exits — a move the live
+        # strategy never makes, which inflated backtest turnover/return.
+        i = exit_i + 1 if exit_i > i else i + 1
     return sig
 
 

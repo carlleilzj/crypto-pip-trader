@@ -1,9 +1,47 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any
+
 import numpy as np
 
 from research.momentum import shape_fit
 from research.pips import find_pips
+
+if TYPE_CHECKING:
+    from research.config import PassedConfig
+
+
+def make_strategy(config: PassedConfig) -> Any:
+    """Factory: pick the strategy class from config.signal.
+
+    All frozen strategies share the same on_bar_close / replay_from contract,
+    so RunLoop can swap them without other changes. ``signal`` in passed.yaml
+    selects: "momentum" (30d), "ema" (EMA crossover), "breakout" (N-bar).
+    """
+    common = dict(
+        hold=int(config.hold),
+        mode=str(config.mode),
+        pip_n=int(config.pip_n),
+        min_bars=int(config.min_bars),
+        fit_exit=float(config.fit_exit),
+        use_pip=bool(config.exit_mode == "pip"),
+        stop_pct=(float(config.stop_pct) if config.stop_pct is not None else None),
+        trail_arm=(float(config.trail_arm) if config.trail_arm is not None else None),
+        trail_giveback=(float(config.trail_giveback) if config.trail_giveback is not None else None),
+    )  # type: dict[str, Any]
+    sig = (config.signal or "momentum").lower()
+    if sig == "breakout":
+        from research.breakout import FrozenBreakoutStrategy
+        return FrozenBreakoutStrategy(n=int(config.n), **common)
+    if sig == "ema":
+        from research.ema import FrozenEMAStrategy
+        return FrozenEMAStrategy(fast=int(config.fast), slow=int(config.slow), **common)
+    # default: 30d time-momentum (legacy spec, parity-fixed)
+    return FrozenMomentumStrategy(
+        lookback=config.lookback,
+        exit_mode=config.exit_mode,  # momentum uses exit_mode, others use use_pip
+        **{k: v for k, v in common.items() if k != "use_pip"},
+    )
 
 
 class FrozenMomentumStrategy:
