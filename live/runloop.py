@@ -39,6 +39,9 @@ ORDER_COLUMNS = [
 # timestamp; honoring it beats a fixed cooldown because further requests
 # during a ban extend the ban.
 _BAN_UNTIL_RE = re.compile(r"banned until (\d+)")
+# 429 replies carry a Retry-After header (surfaced by the broker as
+# "retry-after <s>" when the body has no ban deadline).
+_RETRY_AFTER_RE = re.compile(r"retry[-_ ]after[:= ]+(\d{1,5})", re.IGNORECASE)
 
 
 def _first_unprocessed_idx(klines: pd.DataFrame, last_bar: str | None) -> int:
@@ -399,16 +402,20 @@ class RunLoop:
         self._restored = True
 
     def _arm_cooldown(self, msg: str, base_s: float = 600.0) -> None:
-        """Arm the rate-limit cooldown, honoring an explicit ban deadline.
+        """Arm the rate-limit cooldown from the richest signal available.
 
-        Binance auto-ban (418/-1003) replies carry 'banned until <epoch-ms>';
-        sleeping exactly until then matters because requests made during a
-        ban extend it. Backoff doubles on repeat hits that carry no deadline
-        (429-style) instead of re-arming the same fixed window.
+        Priority: (1) 'banned until <epoch-ms>' from the 418 body — sleeping
+        exactly until then matters because requests made during a ban extend
+        it; (2) Retry-After seconds from a 429 header; (3) base window plus
+        the previous remainder, so repeat hits without a deadline keep
+        growing instead of re-arming the same fixed window.
         """
         ban_ms = self._ban_until_ms(msg)
+        retry_s = self._retry_after_s(msg)
         if ban_ms > 0:
             until = ban_ms / 1000.0 + 5.0  # small margin past the stated end
+        elif retry_s > 0:
+            until = time.time() + retry_s + 5.0
         else:
             prev = max(0.0, self._cooldown_until - time.time())
             until = time.time() + base_s + prev  # exponential-ish backoff
@@ -546,6 +553,12 @@ class RunLoop:
     def _ban_until_ms(msg: str) -> float:
         """Epoch-ms the ban lifts, parsed from 'banned until <ms>'; 0 if absent."""
         m = _BAN_UNTIL_RE.search(str(msg))
+        return float(m.group(1)) if m else 0.0
+
+    @staticmethod
+    def _retry_after_s(msg: str) -> float:
+        """Seconds from a 'retry-after <n>' hint in the error text; 0 if absent."""
+        m = _RETRY_AFTER_RE.search(str(msg))
         return float(m.group(1)) if m else 0.0
 
     def run_one_symbol(self, symbol: str, equity: float) -> dict:

@@ -49,6 +49,60 @@ def _mk_broker() -> BinanceUSDMBroker:
     return b
 
 
+class _R:
+    """Minimal response double; subclasses set status_code/text/headers."""
+
+    status_code = 200
+    text = ""
+    headers: dict = {}
+
+    def json(self):
+        return {}
+
+    def raise_for_status(self):
+        return None
+
+
+def test_public_keeps_body_and_retry_after(monkeypatch):
+    """A 418 from klines must carry the body (ban deadline) + Retry-After.
+
+    Regression for 2026-09-05 08:40 UTC: raise_for_status() dropped the
+    response body, so the runloop never saw 'banned until <ms>' and fell
+    back to a fixed 600s window.
+    """
+    b = _mk_broker()
+
+    class R(_R):
+        status_code = 418
+        text = '{"code":-1003,"msg":"Way too many requests; IP banned until 1788598218000"}'
+        headers = {"Retry-After": "119"}
+
+    monkeypatch.setattr(bb.requests, "get", lambda *a, **k: R())
+    try:
+        b._public("/fapi/v1/klines", {"symbol": "BTCUSDT"})
+    except RuntimeError as e:
+        msg = str(e)
+        assert "binance 418" in msg
+        assert "banned until 1788598218000" in msg
+        assert "retry-after 119" in msg
+    else:
+        raise AssertionError("expected RuntimeError for 418")
+
+
+def test_public_ok_passes_through(monkeypatch):
+    b = _mk_broker()
+
+    class R(_R):
+        status_code = 200
+        text = '[]'
+
+        def json(self):
+            return []
+
+    monkeypatch.setattr(bb.requests, "get", lambda *a, **k: R())
+    assert b._public("/fapi/v1/klines", {}) == []
+
+
 def test_signed_retries_transient_5xx(monkeypatch):
     b = _mk_broker()
     calls = {"n": 0}

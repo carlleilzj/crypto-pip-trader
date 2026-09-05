@@ -476,3 +476,27 @@ def test_restore_defers_until_cooldown_expires(runloop):
     assert calls["restore"] == len(runloop.symbols)
     assert runloop._cooldown_until <= _time.time()
 
+
+def test_cooldown_uses_retry_after_hint(runloop):
+    """429 with a Retry-After header must sleep that long, not fixed 600s."""
+    import time as _time
+
+    runloop._cooldown_until = 0.0
+    runloop._arm_cooldown(
+        'binance 429: {"code":-1003,"msg":"Too many requests"} retry-after 45'
+    )
+    remaining = runloop._cooldown_until - _time.time()
+    assert 44.0 < remaining <= 51.0
+
+
+def test_retry_after_beats_backoff_but_not_ban_deadline(runloop):
+    """Precedence: banned until > retry-after > backoff window."""
+    import time as _time
+
+    runloop._cooldown_until = 0.0
+    # ban deadline present: wins over the retry-after hint in the same text
+    until_ms = (_time.time() + 20 * 60.0) * 1000.0
+    runloop._arm_cooldown(f'banned until {int(until_ms)} retry-after 10')
+    remaining = runloop._cooldown_until - _time.time()
+    assert 19 * 60.0 < remaining <= 20.1 * 60.0
+

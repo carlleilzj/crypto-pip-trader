@@ -40,6 +40,21 @@ def _is_transient_error(exc: Exception) -> bool:
     return any(f'"code":{c}' in msg for c in _TRANSIENT_CODES)
 
 
+def _api_error(r: requests.Response) -> RuntimeError:
+    """Structured venue error keeping the response body and Retry-After.
+
+    raise_for_status() drops both, which cost us the 'banned until <ms>'
+    deadline in the 418 kline incident of 2026-09-05: the runloop could only
+    fall back to a fixed 600s window instead of sleeping out the exact ban.
+    """
+    msg = f"binance {r.status_code}: {r.text}"
+    headers = getattr(r, "headers", None)
+    ra = headers.get("Retry-After") if headers is not None else None
+    if ra:
+        msg += f" retry-after {ra}"
+    return RuntimeError(msg)
+
+
 def load_env_file(path: Path | None = None) -> Path | None:
     """Load KEY=VALUE from a local .env if env vars are unset. Never overrides."""
     global _ENV_LOADED
@@ -111,7 +126,8 @@ class BinanceUSDMBroker:
 
     def _public(self, path: str, params: dict | None = None):
         r = requests.get(self.base + path, params=params or {}, timeout=self.timeout)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raise _api_error(r)
         return r.json()
 
     def _signed(self, method: str, path: str, params: dict) -> dict:
@@ -126,7 +142,7 @@ class BinanceUSDMBroker:
             r = requests.request(method, url, headers=headers, timeout=self.timeout)
             if r.status_code < 400:
                 return r.json() if r.text else {}
-            err = RuntimeError(f"binance {r.status_code}: {r.text}")
+            err = _api_error(r)
             if attempt < _MAX_RETRIES and _is_transient_error(err):
                 time.sleep(_RETRY_SLEEP_S)
                 continue
