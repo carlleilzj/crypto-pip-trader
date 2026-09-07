@@ -443,6 +443,30 @@ def test_rate_limited_klines_abort_cycle(runloop):
     assert runloop._is_rate_limit(summary["error"])
 
 
+def test_hourly_broadcast_survives_rate_limit(runloop, monkeypatch):
+    """The hourly report must fire even when the cycle hit a 418.
+
+    Regression: 2026-09-07 the testnet WAF episode put every cycle into the
+    rate-limit branch for hours; the hourly check lived only on the clean
+    path, so the broadcast went silent and the bot looked dead.
+    """
+    sent = []
+    runloop._cooldown_until = 0.0
+    monkeypatch.setattr(runloop.tg, "due_hourly", lambda: True)
+    monkeypatch.setattr(runloop.tg, "hourly", lambda snap: sent.append(snap))
+    monkeypatch.setattr(runloop.tg, "error", lambda detail: None)
+
+    runloop._handle_rate_limit('binance 418: {"code":-1003,"msg":"Way too many requests"}')
+    assert sent, "hourly broadcast must fire on the rate-limit path too"
+    import time as _time
+
+    assert runloop._cooldown_until > _time.time()  # cooldown still armed
+    # and not due again immediately (send dedups via the hourly state stamp)
+    monkeypatch.setattr(runloop.tg, "due_hourly", lambda: False)
+    runloop._handle_rate_limit("binance 429: too many requests")
+    assert len(sent) == 1
+
+
 def test_cooldown_persists_across_restart(runloop):
     """Armed cooldown must survive a restart so restore doesn't hit a live ban."""
     import time as _time

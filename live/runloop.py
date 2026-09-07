@@ -743,6 +743,14 @@ class RunLoop:
 
         return results
 
+    def _handle_rate_limit(self, msg: str) -> None:
+        """Shared rate-limit reaction: arm cooldown, alert, keep the
+        hourly heartbeat alive (a silent bot for hours looks dead)."""
+        self._arm_cooldown(msg)
+        self.tg.error(f"rate limited, cooling down: {msg}")
+        if self.tg.due_hourly():
+            self.tg.hourly(self.snapshot())
+
     def run_all(self) -> dict:
         """Process one bar for all symbols. Returns aggregated summary."""
         if not getattr(self, "_restored", False):
@@ -752,6 +760,9 @@ class RunLoop:
         summary: dict = {"symbols": {}, "orders": []}
         try:
             equity = self._refresh_equity()
+        except RateLimitedError as e:
+            summary["error"] = str(e)
+            return summary
         except Exception as e:
             return {"error": f"equity fetch failed: {e}", "symbols": {}, "orders": []}
         for sym in self.symbols:
@@ -847,8 +858,7 @@ class RunLoop:
                     err = str(summary.get("error") or "")
                     if err:
                         if self._is_rate_limit(err):
-                            self._arm_cooldown(err)
-                            self.tg.error(f"rate limited, cooling down: {err}")
+                            self._handle_rate_limit(err)
                         elif any(
                             x in err.lower()
                             for x in ("unreachable", "timeout", "timed out", "connection")
@@ -866,8 +876,7 @@ class RunLoop:
                     log.error("step error: %s", e)
                     msg = str(e)
                     if self._is_rate_limit(msg):
-                        self._arm_cooldown(msg)
-                        self.tg.error(f"rate limited, cooling down: {msg}")
+                        self._handle_rate_limit(msg)
                         continue
                     net = any(
                         x in msg.lower()
