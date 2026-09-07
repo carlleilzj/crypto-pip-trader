@@ -398,7 +398,11 @@ class RunLoop:
             except Exception as e:
                 log.error("  %s restore failed: %s", sym, e)
                 self.tg.error(f"{sym} restore failed: {e}")
-            self._ensure_exchange_stop(sym)
+            # _ensure_exchange_stop fires signed queries; skip while a ban
+            # is active or a restore failed with rate-limit (the exchange
+            # stop is degrade-only on testnet; the in-process stop guards).
+            if self._cooldown_until <= time.time():
+                self._ensure_exchange_stop(sym)
         self._restored = True
 
     def _arm_cooldown(self, msg: str, base_s: float = 600.0) -> None:
@@ -791,6 +795,11 @@ class RunLoop:
         """Build a snapshot of current state for Telegram alerts."""
         legs = []
         try:
+            # Skip the signed equity fetch while a rate-limit cooldown is
+            # active: a 418 on a signed request extends the ban, and the
+            # disk-persisted equity is close enough for a heartbeat.
+            if self._cooldown_until > time.time():
+                raise RuntimeError("cooldown active: equity fetch skipped")
             bal = self.broker.usdt_balance()
             self.account["equity"] = float(
                 bal.get("equity") if bal.get("equity") is not None else bal.get("wallet") or 0
