@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import sys
 from pathlib import Path
 
@@ -25,6 +26,21 @@ log = get_logger("testnet")
 REPORT_DIR = ROOT / "reports"
 
 
+def _acquire_instance_lock() -> object | None:
+    """flock a lockfile so a second instance (manual start beside systemd,
+    or two hosts on the same keys) exits instead of double-trading."""
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    fh = (REPORT_DIR / "testnet.lock").open("w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log.error("another testnet instance holds reports/testnet.lock — refusing to start")
+        sys.exit(2)
+    fh.write(str(__import__("os").getpid()) + "\n")
+    fh.flush()
+    return fh  # hold the handle for process lifetime; released on exit
+
+
 def _make_broker() -> BinanceUSDMBroker:
     return BinanceUSDMBroker(testnet=True)
 
@@ -34,6 +50,8 @@ def main() -> None:
     p.add_argument("--loop", type=float, default=0.0, help="minutes between steps; 0 = single run")
     p.add_argument("--min-notional", type=float, default=55.0, help="skip opens below this USD notional")
     args = p.parse_args()
+
+    _lock = _acquire_instance_lock()
 
     load_env_file()
     cfg = PassedConfig.load(ROOT / "configs" / "passed.yaml")

@@ -394,10 +394,16 @@ def test_rate_limit_triggers_cooldown(runloop):
     import time as _time
 
     runloop._cooldown_until = 0.0
+    # "418 Client Error" (HTTP status prefix) is an anchored form; bare
+    # digits inside stop prices (418xx) or clientOrderIds (TN0418…) must not.
     assert runloop._is_rate_limit("418 Client Error: I'm a teapot for url: ...")
     assert runloop._is_rate_limit('binance 418: {"code":-1003,"msg":"Way too many requests"}')
     assert runloop._is_rate_limit('binance 429: {"code":-1003,"msg":"Too many requests"}')
+    assert runloop._is_rate_limit("binance 400: banned until 1788842044401")
     assert not runloop._is_rate_limit("binance 400: some other error")
+    # The false-positive classes the anchoring exists for:
+    assert not runloop._is_rate_limit("binance 400: STOP_MARKET rejected, stop price 41850.5")
+    assert not runloop._is_rate_limit("order TN0429 failed: reduceOnly rejected")
     # Manually arm and verify the loop would skip.
     runloop._cooldown_until = _time.time() + 600.0
     assert runloop._cooldown_until > _time.time()

@@ -231,6 +231,20 @@ class RunLoop:
         """Fetch equity from the broker, roll the day, and update peak."""
         bal = self.broker.usdt_balance()
         equity = float(bal.get("equity") if bal.get("equity") is not None else bal.get("wallet") or 0.0)
+        last_known = float(self.account.get("equity") or 0.0)
+        if equity <= 0.0:
+            # A zero/empty balance payload (transient bad response or a
+            # testnet account reset) must never feed risk.check: dd=1.0
+            # would instantly halt AND flatten every position at a bogus
+            # mark. Keep the last known value and surface the anomaly.
+            if last_known > 0.0:
+                log.warning(
+                    "equity read %.2f <= 0 (reset or bad payload); keeping last known %.2f",
+                    equity, last_known,
+                )
+                self.tg.error(f"equity read {equity:.2f} <= 0; using last known {last_known:.2f}")
+                return last_known
+            raise RuntimeError(f"equity invalid: {equity} (no last known value)")
         day = pd.Timestamp.now(tz="UTC").date().isoformat()
         if self.account.get("day") != day:
             self.account["day"] = day
@@ -416,6 +430,15 @@ class RunLoop:
         for sym in self.symbols:
             try:
                 self._restore_state(sym)
+            except RateLimitedError as e:
+                # A ban hit mid-restore must arm the cooldown here: the loop
+                # paths only arm it via _handle_rate_limit, which restore
+                # never reaches. Otherwise _ensure_exchange_stop below would
+                # still fire signed calls straight into the fresh ban.
+                log.error("  %s restore rate-limited: %s", sym, e)
+                self._arm_cooldown(str(e))
+                self.tg.error(f"{sym} restore rate-limited, cooling down: {e}")
+                break
             except Exception as e:
                 log.error("  %s restore failed: %s", sym, e)
                 self.tg.error(f"{sym} restore failed: {e}")
@@ -574,12 +597,24 @@ class RunLoop:
     @staticmethod
     def _is_rate_limit(msg: str) -> bool:
         low = str(msg).lower()
+        # Anchor on structured markers, never bare digits: stop-rejection
+        # bodies echo stop prices (418xx) and clientOrderIds contain "418"
+        # at TN0418… — matching raw "418"/"429" misclassifies real failures
+        # as rate limits and masks them behind a cooldown.
         return (
-            "418" in low
-            or "429" in low
-            or "-1003" in low
+            "binance 418:" in low
+            or "binance 429:" in low
+            or "http 418" in low
+            or "http 429" in low
+            # requests' HTTPError text form: "<code> Client Error: ..."
+            or "418 client error" in low
+            or "429 client error" in low
+            or '"code":-1003' in low.replace(" ", "")
+            or '"code": -1003' in low
             or "way too many requests" in low
+            or "too many requests" in low
             or "banned until" in low
+            or "retry-after" in low
         )
 
     @staticmethod
@@ -842,9 +877,14 @@ class RunLoop:
                     # cancel) must abort the cycle like a kline 418.
                     raise RateLimitedError(str(e)) from e
                 summary["symbols"][sym] = {"symbol": sym, "error": str(e)}
-            # Refresh equity after any fills so sizing stays accurate
-            with contextlib.suppress(Exception):
+            # Refresh equity after any fills so sizing stays accurate.
+            # A silent failure would leave the next symbol sizing on stale
+            # equity — keep the previous value but surface it once.
+            try:
                 equity = self._refresh_equity()
+            except Exception as e:
+                log.warning("post-fill equity refresh failed (%s); sizing on %.2f", e, equity)
+                summary.setdefault("warnings", []).append(f"equity refresh failed: {e}")
         self._save_account()
         summary["equity"] = equity
         summary["halted"] = self.risk.halted
