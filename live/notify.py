@@ -347,8 +347,9 @@ class TelegramNotifier:
         fit = leg.get("fit")
         sym = str(leg.get("symbol") or "")
         if fit is None or fit >= FIT_WARN or int(leg.get("pos") or 0) == 0:
-            if sym:
-                self.state.setdefault("fit_warn", {}).pop(sym, None)
+            # Save only when something was actually removed — this path runs
+            # every healthy cycle per positioned symbol (3 writes / 5 min).
+            if sym and self.state.get("fit_warn", {}).pop(sym, None) is not None:
                 self._save()
             return
         warned = bool((self.state.get("fit_warn") or {}).get(sym))

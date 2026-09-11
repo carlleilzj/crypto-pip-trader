@@ -515,7 +515,11 @@ class RunLoop:
             if pos_row is None:
                 pos_row = self.broker.position(symbol)
             amt = float(pos_row.get("positionAmt") or 0)
+        except RateLimitedError:
+            raise
         except Exception as e:
+            if self._is_rate_limit(str(e)):
+                raise RateLimitedError(str(e)) from e
             log.warning("  %s stop check: position query failed: %s", symbol, e)
             return
         side = _pos_side(amt)
@@ -529,7 +533,11 @@ class RunLoop:
         stop_px = self.broker.round_price(symbol, entry * (1.0 - self.cfg.stop_pct * side))
         try:
             existing = self.broker.open_orders(symbol)
+        except RateLimitedError:
+            raise
         except Exception as e:
+            if self._is_rate_limit(str(e)):
+                raise RateLimitedError(str(e)) from e
             log.warning("  %s stop check: open orders query failed: %s", symbol, e)
             self.tg.error(f"{symbol} stop check failed (no exchange stop guaranteed): {e}")
             return
@@ -620,6 +628,19 @@ class RunLoop:
         idx = _first_unprocessed_idx(klines, st.get("last_bar"))
         closes = klines["close"].to_numpy(dtype=float)
         if not inject and idx == 0:
+            # idx==0 means last_bar is NEWER than every fetched bar (venue
+            # kline rollback, clock-skewed closed_only filter, or data
+            # glitch). Replaying the whole window would double-count
+            # bars_in_trade/hold_left and corrupt the PIP shape — trust the
+            # local watermark, skip replay, and advance to the newest bar.
+            log.warning(
+                "  %s 本地水位 %s 比返回K线更新，跳过重放以防重复计数",
+                symbol, st.get("last_bar"),
+            )
+            strat.curr_sig = float(st.get("curr_sig") or 0.0)
+            results["skipped"] = True
+            return results
+        if not inject and idx == 0:
             # Gap longer than the fetch window: pull the full trade-length
             # history so the continuing replay stays exact.
             klines = self._fetch_klines(symbol, limit=self.cfg.lookback + self.cfg.hold + 10)
@@ -645,7 +666,15 @@ class RunLoop:
         # Reconcile with exchange truth (post-crash safety)
         try:
             pos_row = self.broker.position(symbol)
+        except RateLimitedError:
+            raise
         except Exception as e:
+            estr = str(e)
+            if self._is_rate_limit(estr):
+                # A 418/429 on a signed call mid-cycle must abort the whole
+                # cycle: continuing to the next symbol sends more signed
+                # requests during the ban and extends it.
+                raise RateLimitedError(estr) from e
             return {"symbol": symbol, "error": f"position query failed: {e}"}
         exch_amt = float(pos_row.get("positionAmt") or 0)
         current = _pos_side(exch_amt)
@@ -789,7 +818,13 @@ class RunLoop:
             summary["error"] = str(e)
             return summary
         except Exception as e:
-            return {"error": f"equity fetch failed: {e}", "symbols": {}, "orders": []}
+            # Balance-API outage must NOT kill stop monitoring: the
+            # in-process 6% stop only runs inside run_one_symbol (testnet
+            # degrades STOP_MARKET away). Fall back to the last persisted
+            # equity so the per-symbol loops still evaluate stops/targets.
+            equity = float(self.account.get("equity") or 0.0)
+            log.warning("equity fetch failed (%s); using last known %.2f", e, equity)
+            summary["warning"] = f"equity fetch failed: {e}"
         for sym in self.symbols:
             try:
                 res = self.run_one_symbol(sym, equity)
@@ -802,6 +837,10 @@ class RunLoop:
                 return summary
             except Exception as e:
                 log.error("  %s error: %s", sym, e)
+                if self._is_rate_limit(str(e)):
+                    # A 418/429 from any signed call (order, position,
+                    # cancel) must abort the cycle like a kline 418.
+                    raise RateLimitedError(str(e)) from e
                 summary["symbols"][sym] = {"symbol": sym, "error": str(e)}
             # Refresh equity after any fills so sizing stays accurate
             with contextlib.suppress(Exception):
@@ -845,7 +884,15 @@ class RunLoop:
                 "bars_in_trade": strat.bars_in_trade,
                 "hold_left": strat.hold_left,
             })
-        return {"acct": self.account, "legs": legs}
+        last_bars = [
+            str(st.get("last_bar")) for st in self.states.values() if st.get("last_bar")
+        ]
+        return {
+            "acct": self.account,
+            "legs": legs,
+            "last_bar": max(last_bars) if last_bars else None,
+            "ping_ok": not getattr(self, "_cooldown_until", 0.0) > time.time(),
+        }
 
     def run_loop(self, loop_minutes: float) -> None:
         """Run the main loop, processing bars on a timer."""

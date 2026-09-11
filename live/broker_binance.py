@@ -113,6 +113,7 @@ class BinanceUSDMBroker:
         if not self.api_key or not self.api_secret:
             raise RuntimeError("set BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_API_SECRET")
         self._filters: dict | None = None
+        self._clock_skew_ms: float = 0.0
 
     def ping(self) -> dict:
         r = requests.get(self.base + "/fapi/v1/ping", timeout=self.timeout)
@@ -132,7 +133,8 @@ class BinanceUSDMBroker:
 
     def _signed(self, method: str, path: str, params: dict) -> dict:
         q = dict(params)
-        q["timestamp"] = int(time.time() * 1000)
+        q.pop("_resynced", None)
+        q["timestamp"] = int(time.time() * 1000 + getattr(self, "_clock_skew_ms", 0.0))
         q["recvWindow"] = 60000
         query = urlencode(q, doseq=True)
         sig = hmac.new(self.api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
@@ -143,6 +145,16 @@ class BinanceUSDMBroker:
             if r.status_code < 400:
                 return r.json() if r.text else {}
             err = _api_error(r)
+            # Clock skew (-1021): resync against server time and retry once
+            # with the corrected offset, so an NTP failure or VM suspend
+            # degrades to one slow call instead of a permanent -1021 loop.
+            if "-1021" in str(err) and not params.get("_resynced"):
+                try:
+                    server = self._public("/fapi/v1/time")
+                    self._clock_skew_ms = float(server.get("serverTime", 0)) - time.time() * 1000
+                except Exception:
+                    self._clock_skew_ms = 0.0
+                return self._signed(method, path, {**params, "_resynced": 1})
             if attempt < _MAX_RETRIES and _is_transient_error(err):
                 time.sleep(_RETRY_SLEEP_S)
                 continue
@@ -260,6 +272,13 @@ class BinanceUSDMBroker:
     def position(self, symbol: str) -> dict:
         rows = self._signed("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
         if isinstance(rows, list) and rows:
+            if len(rows) == 1:
+                return rows[0]
+            # Hedge mode returns one row per side; the zero row would make
+            # reconciliation fight the exchange. Prefer a live position.
+            for row in rows:
+                if float(row.get("positionAmt") or 0) != 0.0:
+                    return row
             return rows[0]
         return {}
 
