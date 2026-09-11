@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import re
 import signal
 import time
@@ -169,6 +170,13 @@ class RunLoop:
                 "restored rate-limit cooldown from disk: %.0fs remaining",
                 self._cooldown_until - time.time(),
             )
+        elif self._cooldown_until:
+            # Expired cooldown: drop it so the persisted file doesn't carry
+            # a stale deadline forever (it is only rewritten on next arm).
+            self._cooldown_until = 0.0
+            self.account["cooldown_until"] = 0
+            with contextlib.suppress(Exception):
+                self._save_account()
         self.risk = RiskGuard(
             notional_frac=self.frac_each,
             max_leverage=float(config.risk.max_leverage),
@@ -213,9 +221,11 @@ class RunLoop:
         }
 
     def _save_account(self) -> None:
-        """Persist account bookkeeping to disk."""
+        """Persist account bookkeeping to disk (atomic replace)."""
         self.account_path.parent.mkdir(parents=True, exist_ok=True)
-        self.account_path.write_text(json.dumps(self.account, indent=2, default=float))
+        tmp = self.account_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(self.account, indent=2, default=float))
+        os.replace(tmp, self.account_path)
 
     def _refresh_equity(self) -> float:
         """Fetch equity from the broker, roll the day, and update peak."""
@@ -225,8 +235,14 @@ class RunLoop:
         if self.account.get("day") != day:
             self.account["day"] = day
             self.account["day_start_equity"] = equity
-            if not self.account.get("halted"):
+            # Daily-loss halts release on rollover; max-DD halts persist
+            # (risk.check keeps them latched). Sync the persisted flag.
+            if self.risk.halted and not self.risk.halt_reason.startswith("max_dd"):
+                self.risk.halted = False
+                self.risk.halt_reason = ""
+            if not self.risk.halted:
                 self.account["halt_reason"] = ""
+            self.account["halted"] = self.risk.halted
             self.risk.day_start_equity = equity
         if equity > float(self.account.get("peak_equity") or 0):
             self.account["peak_equity"] = equity
@@ -271,11 +287,16 @@ class RunLoop:
         }
 
     def _save_state(self, symbol: str, state: dict) -> None:
-        """Persist state for a symbol to disk."""
+        """Persist state for a symbol to disk (atomic replace)."""
         p = self._state_path(symbol)
-        p.write_text(json.dumps(state, indent=2, default=float))
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, indent=2, default=float))
+        os.replace(tmp, p)
         if symbol == "BTCUSDT":
-            self._legacy_state_path().write_text(json.dumps(state, indent=2, default=float))
+            leg = self._legacy_state_path()
+            tmp2 = leg.with_suffix(".json.tmp")
+            tmp2.write_text(json.dumps(state, indent=2, default=float))
+            os.replace(tmp2, leg)
 
     def _restore_state(self, symbol: str) -> None:
         """Rebuild strategy state for an open position after a restart.

@@ -16,7 +16,7 @@ from live.broker_binance import BinanceUSDMBroker, load_env_file, probe_testnet 
 def main() -> None:
     load_env_file()
     ping = probe_testnet()
-    out = {
+    out: dict = {
         "ping": ping,
         "keys": bool(os.environ.get("BINANCE_TESTNET_API_KEY") and os.environ.get("BINANCE_TESTNET_API_SECRET")),
         "positions": {},

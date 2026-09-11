@@ -90,3 +90,34 @@ def test_paper_broker_roundtrip():
     assert closes[0].action == "CLOSE"
     assert closes[0].reduce_only is True
     assert broker.equity != 1000.0
+
+
+def test_daily_loss_halt_releases_next_day():
+    """A daily-loss halt must release on day rollover; max-DD stays latched."""
+    risk = RiskGuard(
+        notional_frac=0.5, daily_loss_halt=0.05, max_drawdown_halt=0.9,
+        day_start_equity=100.0, peak_equity=100.0,
+    )
+    # 6% down -> daily halt latches
+    assert risk.check(94.0) is False
+    assert risk.halt_reason.startswith("daily_loss")
+    # Operator rolls the day (runloop does this on UTC date change):
+    risk.reset_day(94.0)
+    risk.halted = False
+    # and the persisted flow in runloop._refresh_equity clears reason first:
+    risk.halt_reason = ""
+    assert risk.check(94.0) is True  # trading resumes next day
+
+
+def test_max_dd_halt_stays_latched():
+    risk = RiskGuard(
+        notional_frac=0.5, daily_loss_halt=0.9, max_drawdown_halt=0.15,
+        day_start_equity=100.0, peak_equity=100.0,
+    )
+    assert risk.check(84.0) is False
+    assert risk.halt_reason.startswith("max_dd")
+    # even with day rolled and reason cleared, check() stays latched
+    risk.day_start_equity = 84.0
+    risk.halt_reason = ""
+    assert risk.check(84.0) is False
+    assert risk.halt_reason.startswith("max_dd")  # re-latched immediately

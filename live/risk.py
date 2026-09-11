@@ -21,7 +21,14 @@ class RiskGuard:
 
     def check(self, equity: float) -> bool:
         if self.halted:
-            return False
+            # A daily-loss halt releases at the next UTC day (runloop resets
+            # day_start_equity and clears halt state on rollover); a
+            # max-drawdown halt stays until the operator clears it, because
+            # the drawdown condition does not expire with the day.
+            if self.halt_reason.startswith("max_dd"):
+                return False
+            self.halted = False
+            self.halt_reason = ""
         if equity > self.peak_equity:
             self.peak_equity = equity
         if self.peak_equity > 0:

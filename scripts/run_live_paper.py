@@ -21,6 +21,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -151,7 +152,7 @@ def step_once(cfg: PassedConfig) -> dict:
 
     # per-coin brokers seeded from persisted state
     brokers: dict[str, PaperBroker] = {}
-    strats: dict[str, object] = {}
+    strats: dict[str, Any] = {}
     coin_states: dict[str, dict] = {}
     for sym in symbols:
         cs = state.setdefault("per_coin", {}).setdefault(sym, _default_coin_state())
